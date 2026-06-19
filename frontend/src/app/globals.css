@@ -2399,3 +2399,8 @@ tr:hover .wl-remove-btn {
 .changes-table tbody tr:hover .changes-td-name {
   background: rgba(99, 102, 241, 0.06);
 }
+
+/* ── Hide Next.js Dev Indicator ──────────────────────── */
+nextjs-portal {
+  display: none !important;
+}

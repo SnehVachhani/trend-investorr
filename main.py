@@ -686,6 +686,27 @@ def main():
             except Exception as e:
                 logger.error(f"Startup backfill failed: {e} — continuing with existing data")
 
+            # Detect and fill intra-coverage holes (30 min budget)
+            try:
+                logger.info("Checking for intra-coverage holes...")
+                from core.constants import CandleInterval as _CI
+                for iv in [_CI.FIVE_MINUTE, _CI.ONE_DAY]:
+                    hole_stats = ingestion.fill_holes(
+                        interval=iv,
+                        time_budget_minutes=30.0,
+                    )
+                    filled = hole_stats.get("holes_filled", 0)
+                    still_missing = hole_stats.get("still_missing", 0)
+                    if filled > 0 or still_missing > 0:
+                        logger.info(
+                            f"  Hole repair ({iv.value}): "
+                            f"checked {hole_stats['stocks_checked']}, "
+                            f"{filled} filled, {still_missing} remaining "
+                            f"({hole_stats['stopped_reason']})"
+                        )
+            except Exception as e:
+                logger.error(f"Hole repair failed: {e} — continuing with existing data")
+
         # 3. Load historical volume baselines + candle cache from DB
         if ingestion:
             try:
@@ -818,6 +839,30 @@ def main():
             except Exception as e:
                 logger.error(f"Post-market coverage check failed: {e}")
 
+            # Fill intra-coverage holes across ALL intervals (30 min per interval)
+            try:
+                from core.constants import CandleInterval as _CI
+                for iv in [_CI.FIVE_MINUTE, _CI.FIFTEEN_MINUTE,
+                           _CI.ONE_HOUR, _CI.ONE_DAY]:
+                    hole_stats = ingestion.fill_holes(
+                        interval=iv,
+                        time_budget_minutes=30.0,
+                    )
+                    filled = hole_stats.get("holes_filled", 0)
+                    if filled > 0:
+                        logger.info(f"  Post-market hole repair ({iv.value}): {hole_stats}")
+            except Exception as e:
+                logger.error(f"Post-market hole repair failed: {e}")
+
+            # Refresh coverage counts from actual data
+            if coverage_store:
+                try:
+                    for iv_enum in ["FIVE_MINUTE", "FIFTEEN_MINUTE", "ONE_HOUR", "ONE_DAY"]:
+                        coverage_store.refresh_candle_counts(iv_enum)
+                    logger.info("  Coverage counts refreshed from actual data")
+                except Exception as e:
+                    logger.error(f"Coverage refresh failed: {e}")
+
         # 4. Clean up old live ticks (raw WebSocket data, keep last 3 days)
         # Candle data is NEVER deleted — it's permanent historical data.
         # Live ticks are disposable raw data that grows fast (~500K rows/day).
@@ -947,29 +992,38 @@ def main():
     # Start scheduler
     scheduler.start()
 
-    # ── Startup Catch-Up: Fetch data if market already closed ──
-    # If we're starting after 3:30 PM IST and candle tables are empty
-    # or stale, run backfill + indicators immediately instead of
-    # waiting for the next scheduled post-market run.
-    now = datetime.now(IST)
-    market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_weekday = now.weekday() < 5
-
-    if is_weekday and now > market_close_time and ingestion and db:
+    # ── Startup Catch-Up: Run on EVERY boot ──
+    # Unconditionally check for missing data and run the fast SQL aggregations
+    # so that the system is fully synced every time the backend starts, 
+    # exactly as required for morning prep.
+    if ingestion and db:
         try:
             logger.info("=" * 60)
-            logger.info("  STARTUP CATCH-UP: Market closed, checking all intervals...")
+            logger.info("  STARTUP CATCH-UP: Checking intervals and running fast SQL aggregations...")
             logger.info("=" * 60)
 
             # Backfill all candle intervals (smart — skips already-fetched per-stock)
+            # This now inherently includes the extremely fast local SQL aggregation.
             backfill_stats = ingestion.backfill_all_intervals()
             for iv, stats in backfill_stats.items():
                 stored = stats.get("candles_stored", 0)
                 skipped = stats.get("skipped", 0)
+                source = stats.get("source", "api")
                 if stored > 0:
-                    logger.info(f"  Catch-up {iv}: {stored:,} candles stored, {skipped} skipped")
+                    logger.info(f"  Catch-up {iv}: {stored:,} candles stored, {skipped} skipped (via {source})")
+                elif source == "local_aggregate":
+                    logger.info(f"  Catch-up {iv}: Local aggregation complete.")
                 else:
                     logger.info(f"  Catch-up {iv}: up to date ({skipped} stocks complete)")
+
+            # Refresh coverage counts from actual data (fixes accumulated drift)
+            if coverage_store:
+                try:
+                    for iv_enum in ["FIVE_MINUTE", "ONE_HOUR", "ONE_DAY"]:
+                        coverage_store.refresh_candle_counts(iv_enum)
+                    logger.info("  Coverage counts refreshed from actual data")
+                except Exception as e:
+                    logger.error(f"Coverage refresh failed: {e}")
 
             # 2. Compute technical indicators
             ind_stats = ingestion.compute_and_store_indicators()
@@ -985,10 +1039,6 @@ def main():
             logger.info("=" * 60)
         except Exception as e:
             logger.error(f"Startup catch-up failed: {e} — will retry at next scheduled run")
-    elif not is_weekday:
-        logger.info("Startup check: weekend — no catch-up needed")
-    elif now <= market_close_time:
-        logger.info("Startup check: market still open — scheduler will handle data fetch")
 
     logger.info("=" * 60)
     logger.info("  TREND-INVESTORR RUNNING — Press Ctrl+C to stop")

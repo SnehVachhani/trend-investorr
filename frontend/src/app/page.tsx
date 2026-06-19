@@ -78,6 +78,21 @@ export default function DashboardPage() {
             <div className="empty-state-sub">
               Run: uvicorn api.server:app --reload --port 8000
             </div>
+            <button 
+              onClick={() => window.location.reload()}
+              style={{
+                marginTop: '16px',
+                padding: '8px 16px',
+                background: 'var(--accent-primary, #3b82f6)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontWeight: 500
+              }}
+            >
+              Retry Connection
+            </button>
           </div>
         </div>
       </div>

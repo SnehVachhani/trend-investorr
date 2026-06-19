@@ -29,6 +29,7 @@ python-dotenv>=1.0.0
 
 # Logging
 loguru>=0.7.0
+logzero>=1.7.0
 
 # CLI Output
 colorama>=0.4.6

@@ -878,9 +878,9 @@ class CandleCoverageStore:
                 (stock_id, interval, earliest_ts, latest_ts, candle_count, source, last_updated)
             VALUES (%s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (stock_id, interval) DO UPDATE SET
-                earliest_ts = LEAST(candle_coverage.earliest_ts, EXCLUDED.earliest_ts),
-                latest_ts   = GREATEST(candle_coverage.latest_ts, EXCLUDED.latest_ts),
-                candle_count = EXCLUDED.candle_count,
+                earliest_ts  = LEAST(candle_coverage.earliest_ts, EXCLUDED.earliest_ts),
+                latest_ts    = GREATEST(candle_coverage.latest_ts, EXCLUDED.latest_ts),
+                candle_count = candle_coverage.candle_count + EXCLUDED.candle_count,
                 source       = EXCLUDED.source,
                 last_updated = NOW()
             """,
@@ -1042,6 +1042,168 @@ class CandleCoverageStore:
         )
         logger.info(f"Coverage refreshed for {table}: {result} stocks updated")
         return result
+
+    def refresh_candle_counts(self, interval: str) -> int:
+        """
+        Recompute candle_count for ALL stocks from actual candle table data.
+
+        Fixes count drift caused by the upsert() additive accumulation.
+        Should be called after batch operations (backfill, hole-fill, post-market).
+
+        Returns number of rows updated.
+        """
+        from core.constants import CandleInterval, CANDLE_TABLE_SUFFIX
+        iv_enum = CandleInterval(interval) if isinstance(interval, str) else interval
+        suffix = CANDLE_TABLE_SUFFIX.get(iv_enum)
+        if not suffix:
+            raise ValueError(f"Unknown interval: {interval}")
+        table = f"candles_{suffix}"
+
+        result = self._db.execute(
+            f"""
+            UPDATE candle_coverage cc SET
+                candle_count = sub.real_count,
+                last_updated = NOW()
+            FROM (
+                SELECT stock_id, COUNT(*) AS real_count
+                FROM {table}
+                GROUP BY stock_id
+            ) sub
+            WHERE cc.stock_id = sub.stock_id AND cc.interval = %s
+            """,
+            (interval,),
+        )
+        logger.info(f"Coverage counts refreshed for {interval}: {result} stocks reconciled")
+        return result
+
+    def get_trading_days(self, start_date: date, end_date: date) -> list[date]:
+        """
+        Get the list of expected NSE trading days between start_date and end_date.
+
+        Trading day = weekday (Mon-Fri) AND not in NSE_HOLIDAYS list.
+        Uses the holiday calendar from core.constants.
+
+        Returns sorted list of dates.
+        """
+        from datetime import timedelta
+        from core.constants import NSE_HOLIDAYS_2026
+
+        holidays = set()
+        for h in NSE_HOLIDAYS_2026:
+            try:
+                holidays.add(date.fromisoformat(h))
+            except (ValueError, TypeError):
+                continue
+
+        trading_days = []
+        current = start_date
+        while current <= end_date:
+            # Weekday (0=Mon..4=Fri) and not a holiday
+            if current.weekday() < 5 and current not in holidays:
+                trading_days.append(current)
+            current += timedelta(days=1)
+
+        return trading_days
+
+    def find_all_holes(
+        self,
+        interval: str,
+        exchange: str = "NSE",
+    ) -> list[dict]:
+        """
+        For EVERY active stock with coverage, find which trading days
+        are missing candles within the coverage range.
+
+        Uses the NSE holiday calendar to determine expected trading days.
+        Only checks within each stock's own coverage envelope
+        (earliest_ts to latest_ts) — not beyond it.
+
+        Returns:
+            List of dicts, one per stock WITH holes:
+            [
+                {"stock_id": 1, "symbol": "RELIANCE", "token": "2885",
+                 "missing_dates": [date(2026,2,15), date(2026,2,16), ...]},
+                ...
+            ]
+        """
+        from core.constants import CandleInterval, CANDLE_TABLE_SUFFIX
+
+        iv_enum = CandleInterval(interval) if isinstance(interval, str) else interval
+        suffix = CANDLE_TABLE_SUFFIX.get(iv_enum)
+        if not suffix:
+            raise ValueError(f"Unknown interval: {interval}")
+        table = f"candles_{suffix}"
+
+        # 1. Get all stocks with coverage for this interval
+        coverage_rows = self._db.fetch_all(
+            """
+            SELECT cc.stock_id, cc.earliest_ts, cc.latest_ts,
+                   s.symbol, s.token
+            FROM candle_coverage cc
+            JOIN stocks s ON s.id = cc.stock_id
+            WHERE cc.interval = %s
+              AND s.is_active = TRUE
+              AND s.exchange = %s
+              AND cc.earliest_ts IS NOT NULL
+              AND cc.latest_ts IS NOT NULL
+            ORDER BY s.symbol
+            """,
+            (interval, exchange),
+        )
+
+        if not coverage_rows:
+            return []
+
+        # 2. Get actual candle dates for ALL stocks in one query
+        actual_dates_raw = self._db.fetch_all(
+            f"""
+            SELECT stock_id, timestamp::DATE AS candle_date
+            FROM {table}
+            WHERE stock_id IN (
+                SELECT cc.stock_id FROM candle_coverage cc
+                JOIN stocks s ON s.id = cc.stock_id
+                WHERE cc.interval = %s AND s.is_active = TRUE AND s.exchange = %s
+            )
+            GROUP BY stock_id, candle_date
+            ORDER BY stock_id, candle_date
+            """,
+            (interval, exchange),
+        )
+
+        # Build {stock_id: set(dates)}
+        actual_dates_by_stock: dict[int, set[date]] = {}
+        for row in actual_dates_raw:
+            sid = row["stock_id"]
+            if sid not in actual_dates_by_stock:
+                actual_dates_by_stock[sid] = set()
+            actual_dates_by_stock[sid].add(row["candle_date"])
+
+        # 3. For each stock, compare expected vs actual within coverage range
+        results = []
+        for cov in coverage_rows:
+            sid = cov["stock_id"]
+            cov_start = cov["earliest_ts"].date() if hasattr(cov["earliest_ts"], "date") else cov["earliest_ts"]
+            cov_end = cov["latest_ts"].date() if hasattr(cov["latest_ts"], "date") else cov["latest_ts"]
+
+            expected = self.get_trading_days(cov_start, cov_end)
+            actual = actual_dates_by_stock.get(sid, set())
+            missing = [d for d in expected if d not in actual]
+
+            if missing:
+                results.append({
+                    "stock_id": sid,
+                    "symbol": cov["symbol"],
+                    "token": cov["token"],
+                    "missing_dates": sorted(missing),
+                })
+
+        logger.info(
+            f"Hole detection for {interval}: "
+            f"{len(coverage_rows)} stocks checked, "
+            f"{len(results)} with holes, "
+            f"{sum(len(r['missing_dates']) for r in results)} total missing stock-days"
+        )
+        return results
 
 
 class SignalStore:

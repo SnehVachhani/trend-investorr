@@ -143,7 +143,11 @@ class DataIngestionService:
                         latest = existing["latest_ts"]
                         has_enough_history = earliest <= cutoff
                         is_fresh = latest >= freshness_cutoff
-                        if has_enough_history and is_fresh:
+                        # Also verify actual candle count is reasonable
+                        actual_count = existing.get("candle_count", 0)
+                        expected_min = self._min_expected_candles(interval, days)
+                        has_enough_candles = actual_count >= expected_min
+                        if has_enough_history and is_fresh and has_enough_candles:
                             with stats_lock:
                                 stats["skipped"] += 1
                             return
@@ -622,11 +626,9 @@ class DataIngestionService:
         """
         all_stats: dict[str, dict] = {}
 
-        # Fetch API-based intervals (skip ONE_WEEK — it's aggregated)
-        for interval, days in BACKFILL_DAYS.items():
-            if interval == CandleInterval.ONE_WEEK:
-                continue  # Weekly is aggregated, not fetched
-
+        # Fetch API-based intervals (1m and 5m ONLY, to save API limit)
+        for interval in [CandleInterval.ONE_MINUTE, CandleInterval.FIVE_MINUTE]:
+            days = BACKFILL_DAYS[interval]
             logger.info(f"Backfilling {interval.value}: {days} days")
             stats = self.backfill(
                 days=days,
@@ -635,6 +637,13 @@ class DataIngestionService:
                 batch_pause=batch_pause,
             )
             all_stats[interval.value] = stats
+
+        # Fast local SQL aggregation for 15m, 1h, 1d from the downloaded 5m data
+        logger.info("Running fast local SQL aggregation for 15m, 1h, 1d...")
+        self.aggregate_fast_local()
+        all_stats[CandleInterval.FIFTEEN_MINUTE.value] = {"source": "local_aggregate"}
+        all_stats[CandleInterval.ONE_HOUR.value] = {"source": "local_aggregate"}
+        all_stats[CandleInterval.ONE_DAY.value] = {"source": "local_aggregate"}
 
         # Aggregate weekly candles from daily data
         logger.info("Aggregating weekly candles from daily data...")
@@ -645,6 +654,91 @@ class DataIngestionService:
 
         logger.info(f"All-interval backfill complete: {list(all_stats.keys())}")
         return all_stats
+
+    def aggregate_fast_local(self) -> None:
+        """
+        Aggregates 15m, 1h, and 1d natively in SQL from 5m data.
+        Exponentially faster than making API requests.
+        """
+        queries = {
+            "15m": """
+                INSERT INTO candles_15m (stock_id, timestamp, open, high, low, close, volume, vwap)
+                SELECT 
+                    stock_id,
+                    date_trunc('hour', timestamp) + floor(extract(minute FROM timestamp) / 15) * interval '15 min' AS agg_ts,
+                    (array_agg(open ORDER BY timestamp))[1],
+                    MAX(high),
+                    MIN(low),
+                    (array_agg(close ORDER BY timestamp DESC))[1],
+                    SUM(volume),
+                    COALESCE(SUM(vwap * volume) / NULLIF(SUM(volume), 0), 0)
+                FROM candles_5m
+                GROUP BY stock_id, agg_ts
+                ON CONFLICT (stock_id, timestamp) DO NOTHING;
+            """,
+            "1h": """
+                INSERT INTO candles_1h (stock_id, timestamp, open, high, low, close, volume, vwap)
+                SELECT 
+                    stock_id,
+                    date_trunc('hour', timestamp) AS agg_ts,
+                    (array_agg(open ORDER BY timestamp))[1],
+                    MAX(high),
+                    MIN(low),
+                    (array_agg(close ORDER BY timestamp DESC))[1],
+                    SUM(volume),
+                    COALESCE(SUM(vwap * volume) / NULLIF(SUM(volume), 0), 0)
+                FROM candles_5m
+                GROUP BY stock_id, agg_ts
+                ON CONFLICT (stock_id, timestamp) DO NOTHING;
+            """,
+            "1d": """
+                INSERT INTO candles_1d (stock_id, timestamp, open, high, low, close, volume, vwap, delivery_qty, delivery_pct)
+                SELECT 
+                    stock_id,
+                    date_trunc('day', timestamp) + interval '15 hours 30 minutes' AS agg_ts,
+                    (array_agg(open ORDER BY timestamp))[1],
+                    MAX(high),
+                    MIN(low),
+                    (array_agg(close ORDER BY timestamp DESC))[1],
+                    SUM(volume),
+                    COALESCE(SUM(vwap * volume) / NULLIF(SUM(volume), 0), 0),
+                    0,
+                    0
+                FROM candles_5m
+                GROUP BY stock_id, agg_ts
+                ON CONFLICT (stock_id, timestamp) DO NOTHING;
+            """
+        }
+        
+        for interval, query in queries.items():
+            logger.info(f"  -> Aggregating {interval} locally...")
+            self._candle_store._db.execute(query)
+            
+        tables = {
+            "FIFTEEN_MINUTE": "candles_15m",
+            "ONE_HOUR": "candles_1h",
+            "ONE_DAY": "candles_1d"
+        }
+        for iv_enum, table in tables.items():
+            logger.info(f"  -> Updating coverage map for {iv_enum}...")
+            query = f"""
+            INSERT INTO candle_coverage (stock_id, interval, earliest_ts, latest_ts, candle_count, source, last_updated)
+            SELECT 
+                stock_id,
+                %s,
+                MIN(timestamp),
+                MAX(timestamp),
+                COUNT(*),
+                'local_aggregate',
+                NOW()
+            FROM {table}
+            GROUP BY stock_id
+            ON CONFLICT (stock_id, interval) DO UPDATE SET 
+                latest_ts = EXCLUDED.latest_ts,
+                candle_count = EXCLUDED.candle_count,
+                last_updated = NOW();
+            """
+            self._candle_store._db.execute(query, (iv_enum,))
 
     # ── Bhavcopy Persistence ─────────────────────────────
 
@@ -1076,3 +1170,307 @@ class DataIngestionService:
             high_52w=float(row.get("high_52w") or 0),
             low_52w=float(row.get("low_52w") or 0),
         )
+
+    # ── Gap Detection & Hole Filling ─────────────────────
+
+    @staticmethod
+    def _min_expected_candles(interval: CandleInterval, days: int) -> int:
+        """
+        Minimum expected candle count to consider coverage 'complete'.
+
+        Uses 80% of theoretical max to account for holidays,
+        half-days, and minor variations.
+        """
+        # Approximate trading days = days * 5/7 (exclude weekends)
+        trading_days = int(days * 5 / 7)
+        candles_per_day = {
+            CandleInterval.ONE_MINUTE: 375,    # 9:15-15:30 = 375 minutes
+            CandleInterval.FIVE_MINUTE: 75,
+            CandleInterval.FIFTEEN_MINUTE: 25,
+            CandleInterval.ONE_HOUR: 6,
+            CandleInterval.ONE_DAY: 1,
+            CandleInterval.ONE_WEEK: 0.2,      # ~1 per 5 trading days
+        }
+        per_day = candles_per_day.get(interval, 1)
+        return int(trading_days * per_day * 0.80)
+
+    @staticmethod
+    def _group_consecutive_dates(dates: list[date]) -> list[tuple[date, date]]:
+        """
+        Group consecutive dates into (start, end) ranges to minimize API calls.
+
+        Example:
+            [Jan 15, Jan 16, Jan 17, Feb 2, Feb 3]
+            → [(Jan 15, Jan 17), (Feb 2, Feb 3)]
+
+        Instead of 5 API calls (one per date), we make 2 (one per range).
+        """
+        if not dates:
+            return []
+
+        sorted_dates = sorted(dates)
+        ranges: list[tuple[date, date]] = []
+        range_start = sorted_dates[0]
+        range_end = sorted_dates[0]
+
+        for d in sorted_dates[1:]:
+            if (d - range_end).days <= 1:
+                # Consecutive (or same day) — extend current range
+                range_end = d
+            else:
+                # Gap found — close current range, start new one
+                ranges.append((range_start, range_end))
+                range_start = d
+                range_end = d
+
+        # Close the last range
+        ranges.append((range_start, range_end))
+        return ranges
+
+    def fill_holes(
+        self,
+        interval: CandleInterval = CandleInterval.FIVE_MINUTE,
+        exchange: str = "NSE",
+        time_budget_minutes: float = 30.0,
+        batch_pause: float = 0.3,
+    ) -> dict[str, Any]:
+        """
+        Detect and fill missing candle data for ALL active stocks.
+
+        Keeps running until either:
+          - All holes are filled, OR
+          - time_budget_minutes have elapsed
+
+        Remaining unfilled holes stay as absent rows in the candle table.
+        They'll be detected and retried on the next run (next restart,
+        next post_market, next warm-up).
+
+        Args:
+            interval: Candle interval to check.
+            exchange: Stock exchange filter.
+            time_budget_minutes: Max time to spend filling holes.
+            batch_pause: Seconds to pause between API calls.
+
+        Returns:
+            Stats dict with stocks_checked, stocks_with_holes, holes_filled,
+            candles_added, still_missing, errors, elapsed_seconds, stopped_reason.
+        """
+        if not self._coverage:
+            logger.warning("fill_holes: no coverage store configured, skipping")
+            return {"error": "no coverage store"}
+
+        start_time = time.time()
+        deadline = start_time + (time_budget_minutes * 60)
+
+        stats: dict[str, Any] = {
+            "stocks_checked": 0,
+            "stocks_with_holes": 0,
+            "holes_filled": 0,
+            "candles_added": 0,
+            "still_missing": 0,
+            "errors": 0,
+            "elapsed_seconds": 0.0,
+            "stopped_reason": "all_filled",
+        }
+
+        # 1. Detect all holes
+        logger.info(f"fill_holes({interval.value}): detecting missing trading days...")
+        stocks_with_holes = self._coverage.find_all_holes(interval.value, exchange)
+        stats["stocks_checked"] = len(self._stock_store.get_all_active(exchange=exchange))
+        stats["stocks_with_holes"] = len(stocks_with_holes)
+
+        if not stocks_with_holes:
+            stats["elapsed_seconds"] = time.time() - start_time
+            logger.info(f"fill_holes({interval.value}): no holes found — all data complete")
+            return stats
+
+        total_missing_days = sum(len(s["missing_dates"]) for s in stocks_with_holes)
+        logger.info(
+            f"fill_holes({interval.value}): found {len(stocks_with_holes)} stocks "
+            f"with {total_missing_days} total missing stock-days. "
+            f"Time budget: {time_budget_minutes} min"
+        )
+
+        # 2. Fill holes stock by stock
+        for stock_info in stocks_with_holes:
+            # Check time budget
+            if time.time() >= deadline:
+                stats["stopped_reason"] = "time_budget"
+                logger.info(
+                    f"fill_holes({interval.value}): time budget exhausted "
+                    f"after {time_budget_minutes} min"
+                )
+                break
+
+            sid = stock_info["stock_id"]
+            symbol = stock_info["symbol"]
+            token = stock_info["token"]
+            missing_dates = stock_info["missing_dates"]
+
+            # Group consecutive missing dates into ranges
+            date_ranges = self._group_consecutive_dates(missing_dates)
+
+            stock_candles_added = 0
+            stock_errors = 0
+
+            for range_start, range_end in date_ranges:
+                # Check time budget before each API call
+                if time.time() >= deadline:
+                    stats["stopped_reason"] = "time_budget"
+                    break
+
+                try:
+                    # Convert dates to datetimes for the API
+                    from core.constants import IST as _IST
+                    fetch_start = datetime.combine(
+                        range_start, datetime.min.time()
+                    ).replace(hour=9, minute=15, tzinfo=_IST)
+                    fetch_end = datetime.combine(
+                        range_end, datetime.min.time()
+                    ).replace(hour=15, minute=30, tzinfo=_IST)
+
+                    candles = self._fetcher.get_candles_range(
+                        symbol=symbol,
+                        token=token,
+                        start=fetch_start,
+                        end=fetch_end,
+                        interval=interval,
+                    )
+
+                    if candles:
+                        if interval == CandleInterval.ONE_DAY:
+                            rows = [
+                                (
+                                    sid, c.timestamp, c.open, c.high, c.low,
+                                    c.close, c.volume, c.vwap,
+                                    getattr(c, "delivery_qty", 0) or 0,
+                                    getattr(c, "delivery_pct", 0) or 0,
+                                )
+                                for c in candles
+                            ]
+                        else:
+                            rows = [
+                                (
+                                    sid, c.timestamp, c.open, c.high, c.low,
+                                    c.close, c.volume, c.vwap,
+                                )
+                                for c in candles
+                            ]
+                        self._candle_store.insert_batch(interval, rows)
+                        stock_candles_added += len(rows)
+
+                    time.sleep(batch_pause)
+
+                except DataFetchError as e:
+                    stock_errors += 1
+                    logger.debug(
+                        f"fill_holes: API error for {symbol} "
+                        f"({range_start} to {range_end}): {e}"
+                    )
+                except Exception as e:
+                    stock_errors += 1
+                    logger.warning(
+                        f"fill_holes: unexpected error for {symbol} "
+                        f"({range_start} to {range_end}): {e}"
+                    )
+
+            if stock_candles_added > 0:
+                stats["holes_filled"] += 1
+                stats["candles_added"] += stock_candles_added
+                logger.debug(
+                    f"fill_holes: {symbol} — {stock_candles_added} candles added "
+                    f"across {len(date_ranges)} date ranges"
+                )
+            elif stock_errors > 0:
+                stats["still_missing"] += 1
+
+            stats["errors"] += stock_errors
+
+        # 3. Refresh coverage counts from actual data
+        if stats["candles_added"] > 0 and self._coverage:
+            try:
+                self._coverage.refresh_candle_counts(interval.value)
+            except Exception as e:
+                logger.warning(f"fill_holes: coverage refresh failed: {e}")
+
+        stats["elapsed_seconds"] = round(time.time() - start_time, 1)
+        logger.info(
+            f"fill_holes({interval.value}) complete: "
+            f"{stats['holes_filled']} stocks repaired, "
+            f"{stats['candles_added']:,} candles added, "
+            f"{stats['still_missing']} still missing, "
+            f"{stats['errors']} errors, "
+            f"{stats['elapsed_seconds']}s elapsed "
+            f"({stats['stopped_reason']})"
+        )
+        return stats
+
+    def detect_and_report_gaps(
+        self,
+        interval: CandleInterval = CandleInterval.FIVE_MINUTE,
+        exchange: str = "NSE",
+    ) -> dict[str, Any]:
+        """
+        Diagnostic-only method: detect ALL gaps for ALL stocks without
+        fetching anything. Returns a report for logging/debugging.
+
+        Returns:
+            {
+                "no_coverage": [...],
+                "stale_coverage": [...],
+                "stocks_with_holes": [...],
+                "summary": {
+                    "total_stocks": N,
+                    "fully_complete": N,
+                    "with_holes": N,
+                    "no_data": N,
+                    "total_missing_stock_days": N,
+                }
+            }
+        """
+        if not self._coverage:
+            return {"error": "no coverage store"}
+
+        all_stocks = self._stock_store.get_all_active(exchange=exchange)
+        all_stock_ids = {s["id"] for s in all_stocks}
+
+        # Stocks with no coverage at all
+        covered = self._coverage.get_all_for_interval(interval.value)
+        covered_ids = {c["stock_id"] for c in covered}
+        no_coverage = [
+            {"stock_id": s["id"], "symbol": s["symbol"], "token": s["token"]}
+            for s in all_stocks if s["id"] not in covered_ids
+        ]
+
+        # Stale coverage (latest_ts > 2 days old)
+        stale = self._coverage.find_stale(interval.value, stale_hours=48)
+
+        # Intra-coverage holes
+        stocks_with_holes = self._coverage.find_all_holes(interval.value, exchange)
+
+        total_missing_days = sum(len(s["missing_dates"]) for s in stocks_with_holes)
+        with_holes_count = len(stocks_with_holes)
+
+        report = {
+            "no_coverage": no_coverage,
+            "stale_coverage": stale,
+            "stocks_with_holes": stocks_with_holes,
+            "summary": {
+                "total_stocks": len(all_stocks),
+                "fully_complete": len(all_stocks) - len(no_coverage) - with_holes_count,
+                "with_holes": with_holes_count,
+                "no_data": len(no_coverage),
+                "stale": len(stale),
+                "total_missing_stock_days": total_missing_days,
+            },
+        }
+
+        logger.info(
+            f"Gap report ({interval.value}): "
+            f"{report['summary']['total_stocks']} total, "
+            f"{report['summary']['fully_complete']} complete, "
+            f"{report['summary']['with_holes']} with holes, "
+            f"{report['summary']['no_data']} no data, "
+            f"{report['summary']['total_missing_stock_days']} missing stock-days"
+        )
+        return report

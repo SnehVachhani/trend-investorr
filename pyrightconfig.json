@@ -1,0 +1,8 @@
+{
+  "venvPath": "/Users/macbookpro/Glyphit/trend-investorr",
+  "venv": "venv",
+  "pythonVersion": "3.11",
+  "extraPaths": [
+    "/Users/macbookpro/Glyphit/trend-investorr/venv/lib/python3.11/site-packages"
+  ]
+}

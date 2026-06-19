@@ -103,6 +103,7 @@ class HistoricalFetcher:
         end: datetime,
         interval: CandleInterval = CandleInterval.ONE_DAY,
         exchange: Exchange = Exchange.NSE,
+        failure_collector: list[dict] | None = None,
     ) -> list[Candle]:
         """
         Fetch candle data for a specific date range.
@@ -117,6 +118,9 @@ class HistoricalFetcher:
             end: End datetime (inclusive).
             interval: Candle interval.
             exchange: Stock exchange.
+            failure_collector: Optional list to collect failed chunk metadata.
+                If provided, failed chunks append {start, end, error} dicts.
+                Backward compatible — existing callers don't pass this.
 
         Returns:
             List of Candle dataclasses, sorted by timestamp ascending.
@@ -149,6 +153,12 @@ class HistoricalFetcher:
                     f"Failed to fetch chunk for {symbol} "
                     f"({current_start.date()} to {current_end.date()}): {e}"
                 )
+                if failure_collector is not None:
+                    failure_collector.append({
+                        "start": current_start.isoformat(),
+                        "end": current_end.isoformat(),
+                        "error": str(e),
+                    })
 
             current_start = current_end + timedelta(minutes=1)
 

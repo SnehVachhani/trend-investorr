@@ -242,6 +242,9 @@ class InstrumentLoader:
                 name = item.get("name", symbol)
                 exch_str = item.get("exch_seg", "").upper()
                 series = item.get("symbol", "").split("-")[-1] if "-" in item.get("symbol", "") else "EQ"
+                
+                if token.startswith("999"):
+                    series = "IDX"
                 lot_size = int(item.get("lotsize", 1) or 1)
 
                 if not symbol or not token:
@@ -393,7 +396,7 @@ class InstrumentLoader:
     #   SM = SME platform stocks (NSE Emerge)
     #   ST = SME trade-to-trade
     #   BZ = Trade-to-trade under ASM/GSM surveillance
-    EQUITY_SERIES = frozenset({"EQ", "BE", "SM", "ST", "BZ"})
+    EQUITY_SERIES = frozenset({"EQ", "BE", "SM", "ST", "BZ", "IDX"})
 
     def get_nse_equity_symbols(self) -> list[str]:
         """Get all NSE equity symbols (all tradeable equity series)."""
