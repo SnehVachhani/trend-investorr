@@ -1358,6 +1358,13 @@ class DataIngestionService:
                             ]
                         self._candle_store.insert_batch(interval, rows)
                         stock_candles_added += len(rows)
+                    else:
+                        # Angel One returned 0 candles. Mark these trading days as empty.
+                        if self._coverage:
+                            empty_days = self._coverage.get_trading_days(range_start, range_end)
+                            for eday in empty_days:
+                                self._coverage.mark_empty_day(sid, interval.value, eday)
+                            logger.debug(f"fill_holes: {symbol} — Marked {len(empty_days)} days as empty (0 candles returned)")
 
                     time.sleep(batch_pause)
 

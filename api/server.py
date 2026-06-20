@@ -593,11 +593,11 @@ def get_watchlist_prices(watchlist_id: int):
             WHERE stock_id IN (SELECT stock_id FROM wl_stocks)
         ),
         latest_candle AS (
-            SELECT stock_id, close AS latest_close
+            SELECT stock_id, close AS latest_close, timestamp AS latest_ts
             FROM recent_candles WHERE rn = 1
         ),
         prev_candle AS (
-            SELECT stock_id, close AS prev_close
+            SELECT stock_id, close AS prev_close, timestamp AS prev_ts
             FROM recent_candles WHERE rn = 2
         )
         SELECT ws.stock_id,
@@ -608,7 +608,9 @@ def get_watchlist_prices(watchlist_id: int):
                t.volume,
                t.timestamp AS tick_time,
                lc.latest_close,
-               pc.prev_close
+               lc.latest_ts,
+               pc.prev_close,
+               pc.prev_ts
         FROM wl_stocks ws
         LEFT JOIN latest_tick t ON t.stock_id = ws.stock_id
         LEFT JOIN latest_candle lc ON lc.stock_id = ws.stock_id
@@ -622,9 +624,18 @@ def get_watchlist_prices(watchlist_id: int):
         tick_ltp = float(r["ltp"]) if r["ltp"] else None
         latest_close = float(r["latest_close"]) if r["latest_close"] else None
         prev_close = float(r["prev_close"]) if r["prev_close"] else None
+        tick_time = r["tick_time"]
+        latest_ts = r["latest_ts"]
 
-        if tick_ltp:
-            # Live tick available — use it as LTP, prev_close = latest candle close
+        if tick_ltp and tick_time and latest_ts:
+            if tick_time.date() == latest_ts.date():
+                ltp = tick_ltp
+                ref_close = prev_close
+            else:
+                ltp = tick_ltp
+                ref_close = latest_close
+        elif tick_ltp:
+            # Fallback
             ltp = tick_ltp
             ref_close = latest_close
         else:

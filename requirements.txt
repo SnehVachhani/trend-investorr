@@ -38,6 +38,7 @@ rich>=13.7.0
 
 # Utilities
 numpy>=1.26.0
+exchange_calendars>=4.5.0
 
 # Testing
 pytest>=7.4.0

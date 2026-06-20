@@ -690,7 +690,8 @@ def main():
             try:
                 logger.info("Checking for intra-coverage holes...")
                 from core.constants import CandleInterval as _CI
-                for iv in [_CI.FIVE_MINUTE, _CI.ONE_DAY]:
+                for iv in [_CI.ONE_MINUTE, _CI.FIVE_MINUTE, _CI.FIFTEEN_MINUTE,
+                           _CI.ONE_HOUR, _CI.ONE_DAY]:
                     hole_stats = ingestion.fill_holes(
                         interval=iv,
                         time_budget_minutes=30.0,
@@ -842,7 +843,7 @@ def main():
             # Fill intra-coverage holes across ALL intervals (30 min per interval)
             try:
                 from core.constants import CandleInterval as _CI
-                for iv in [_CI.FIVE_MINUTE, _CI.FIFTEEN_MINUTE,
+                for iv in [_CI.ONE_MINUTE, _CI.FIVE_MINUTE, _CI.FIFTEEN_MINUTE,
                            _CI.ONE_HOUR, _CI.ONE_DAY]:
                     hole_stats = ingestion.fill_holes(
                         interval=iv,

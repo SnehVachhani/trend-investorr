@@ -887,6 +887,22 @@ class CandleCoverageStore:
             (stock_id, interval, earliest, latest, candle_count, source),
         )
 
+    def delete_coverage(self, stock_id: int, interval: str) -> None:
+        """Delete coverage record."""
+        self._db.execute(
+            "DELETE FROM candle_coverage WHERE stock_id = %s AND interval = %s",
+            (stock_id, interval),
+        )
+
+    def mark_empty_day(self, stock_id: int, interval: str, empty_date: date) -> None:
+        """Mark a specific day as empty for a stock so it is not repeatedly requested."""
+        query = """
+            INSERT INTO empty_stock_days (stock_id, interval, date)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (stock_id, interval, date) DO NOTHING
+        """
+        self._db.execute(query, (stock_id, interval, empty_date))
+
     def get(self, stock_id: int, interval: str) -> dict | None:
         """Get coverage info for a specific stock + interval."""
         return self._db.fetch_one(
@@ -1079,44 +1095,24 @@ class CandleCoverageStore:
     def get_trading_days(self, start_date: date, end_date: date) -> list[date]:
         """
         Get the list of expected NSE trading days between start_date and end_date.
-
-        Trading day = weekday (Mon-Fri) AND not in NSE_HOLIDAYS list.
         Uses the holiday calendar from core.constants.
-
-        Returns sorted list of dates.
         """
-        from datetime import timedelta
-        from core.constants import NSE_HOLIDAYS_2026
-
-        holidays = set()
-        for h in NSE_HOLIDAYS_2026:
-            try:
-                holidays.add(date.fromisoformat(h))
-            except (ValueError, TypeError):
-                continue
-
-        trading_days = []
-        current = start_date
-        while current <= end_date:
-            # Weekday (0=Mon..4=Fri) and not a holiday
-            if current.weekday() < 5 and current not in holidays:
-                trading_days.append(current)
-            current += timedelta(days=1)
-
-        return trading_days
+        from core.constants import get_nse_trading_days
+        return get_nse_trading_days(start_date, end_date)
 
     def find_all_holes(
         self,
         interval: str,
         exchange: str = "NSE",
+        default_missing_days: int = 90,
     ) -> list[dict]:
         """
-        For EVERY active stock with coverage, find which trading days
-        are missing candles within the coverage range.
+        For EVERY active stock, find which trading days are missing candles.
+        If a stock has NO data, it assumes `default_missing_days` are missing.
 
         Uses the NSE holiday calendar to determine expected trading days.
         Only checks within each stock's own coverage envelope
-        (earliest_ts to latest_ts) — not beyond it.
+        (earliest_ts to latest_ts) — or synthetic envelope for new stocks.
 
         Returns:
             List of dicts, one per stock WITH holes:
@@ -1126,7 +1122,8 @@ class CandleCoverageStore:
                 ...
             ]
         """
-        from core.constants import CandleInterval, CANDLE_TABLE_SUFFIX
+        from datetime import datetime, timedelta
+        from core.constants import CandleInterval, CANDLE_TABLE_SUFFIX, IST
 
         iv_enum = CandleInterval(interval) if isinstance(interval, str) else interval
         suffix = CANDLE_TABLE_SUFFIX.get(iv_enum)
@@ -1151,23 +1148,49 @@ class CandleCoverageStore:
             (interval, exchange),
         )
 
+        # 1b. Get totally missing stocks (no coverage at all)
+        missing_stocks = self._db.fetch_all(
+            """
+            SELECT s.id AS stock_id, s.symbol, s.token
+            FROM stocks s
+            WHERE s.is_active = TRUE
+              AND s.exchange = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM candle_coverage cc 
+                  WHERE cc.stock_id = s.id AND cc.interval = %s
+              )
+            """,
+            (exchange, interval),
+        )
+
+        # Inject synthetic coverage for completely missing stocks
+        now = datetime.now(tz=IST)
+        synthetic_start = now - timedelta(days=default_missing_days)
+        
+        for ms in missing_stocks:
+            coverage_rows.append({
+                "stock_id": ms["stock_id"],
+                "symbol": ms["symbol"],
+                "token": ms["token"],
+                "earliest_ts": synthetic_start,
+                "latest_ts": now,
+            })
+
         if not coverage_rows:
             return []
 
-        # 2. Get actual candle dates for ALL stocks in one query
+        # 2. Get actual candle dates for ALL active stocks in one query
         actual_dates_raw = self._db.fetch_all(
             f"""
             SELECT stock_id, timestamp::DATE AS candle_date
             FROM {table}
             WHERE stock_id IN (
-                SELECT cc.stock_id FROM candle_coverage cc
-                JOIN stocks s ON s.id = cc.stock_id
-                WHERE cc.interval = %s AND s.is_active = TRUE AND s.exchange = %s
+                SELECT id FROM stocks WHERE is_active = TRUE AND exchange = %s
             )
             GROUP BY stock_id, candle_date
             ORDER BY stock_id, candle_date
             """,
-            (interval, exchange),
+            (exchange,),
         )
 
         # Build {stock_id: set(dates)}
@@ -1177,6 +1200,24 @@ class CandleCoverageStore:
             if sid not in actual_dates_by_stock:
                 actual_dates_by_stock[sid] = set()
             actual_dates_by_stock[sid].add(row["candle_date"])
+
+        # 2b. Get empty days for ALL active stocks in one query
+        empty_dates_raw = self._db.fetch_all(
+            f"""
+            SELECT stock_id, date AS empty_date
+            FROM empty_stock_days
+            WHERE interval = %s AND stock_id IN (
+                SELECT id FROM stocks WHERE is_active = TRUE AND exchange = %s
+            )
+            """,
+            (interval, exchange),
+        )
+
+        for row in empty_dates_raw:
+            sid = row["stock_id"]
+            if sid not in actual_dates_by_stock:
+                actual_dates_by_stock[sid] = set()
+            actual_dates_by_stock[sid].add(row["empty_date"])
 
         # 3. For each stock, compare expected vs actual within coverage range
         results = []
@@ -1199,7 +1240,8 @@ class CandleCoverageStore:
 
         logger.info(
             f"Hole detection for {interval}: "
-            f"{len(coverage_rows)} stocks checked, "
+            f"{len(coverage_rows)} stocks checked "
+            f"({len(missing_stocks)} completely un-ingested), "
             f"{len(results)} with holes, "
             f"{sum(len(r['missing_dates']) for r in results)} total missing stock-days"
         )
