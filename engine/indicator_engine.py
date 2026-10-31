@@ -246,11 +246,18 @@ class IndicatorEngine:
             avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gains[i]) / period
             avg_loss[i] = (avg_loss[i - 1] * (period - 1) + losses[i]) / period
 
+        # Wilder RSI treats a zero average loss as a fully overbought reading
+        # when gains exist.  The previous fallback used RS=1, which returned
+        # RSI=50 for a continuously rising series and distorted every RSI
+        # based filter on that edge case.
         rs = np.divide(
             avg_gain, avg_loss,
-            out=np.ones_like(avg_gain), where=avg_loss != 0,
+            out=np.full_like(avg_gain, np.inf),
+            where=avg_loss != 0,
         )
         rsi = 100 - (100 / (1 + rs))
+        flat = (avg_gain == 0) & (avg_loss == 0)
+        rsi[flat] = 50.0
 
         rsi_full = np.full(len(closes), 50.0)
         rsi_full[1:] = rsi

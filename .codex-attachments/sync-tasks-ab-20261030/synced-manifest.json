@@ -1,0 +1,19 @@
+{
+  "README.md": "369cdcf69f09e723de8f0c2fabf60e8cf538f56de4bd6d2961ea69e9e3903b3e",
+  "storage/database.py": "75819651e660d02afde1489b948e080f6f681abc4e709bce052b8b2645cd57f8",
+  "scripts/scratch_postgres.sh": "d63638e74bcddf8c44ca868e879b62df2cf455e44daacb9e16c05094417dda21",
+  "api/server.py": "735dbd71220d788e1ccb0fbcbe85e90a86f431fbc964452b8c66172db23c0f6f",
+  "tests/api/_replay_process_harness.py": "01ef80d171892307aa2328ba719b59bbb663b69249cd05defd398c2c196f3543",
+  "tests/api/test_enhanced_momentum_backtest_job_postgres.py": "42ab6b2a1a368b5a474740c4b5f49245aef3495e3da1c5a7b6beccd4f8511c0b",
+  "tests/api/BASELINE_FAILURES_enhanced_momentum_replay.md": "8a8996f5e5169d82231525b56bd467a79eb6b35e7fa1638de92dfed3fd16600c",
+  "tests/api/test_enhanced_momentum_backtest_job_durability.py": "717b339e40dbbfc3bbd93006c69a34b83e38dd49c646f65006213c1ac6f0273f",
+  "tests/api/test_enhanced_momentum_replay_workers.py": "6cabefeb618bff4c07d16c71358460ebb94f637a6255c91c749acbd349a11079",
+  "requirements.txt": "d4679d1d305b0d5d5166e519c55f3727f3461b9acb008de053646cee0a9e7109",
+  "data/streams/websocket_manager.py": "55eb895c147992d225ae210f8ce928e8246c823d0db4815effbe7c85841342fb",
+  "tests/data/conftest.py": "4cce6b081f27a67bec5a94835c2269f0e777e7c5bf7a55df53bcef7111f4e91b",
+  "tests/data/ws_fakes.py": "9e537731bf35449d55cd7c8e40e6146eae0a6905aae2110fd31d105203b1ad9a",
+  "tests/data/test_websocket_subscriptions.py": "fd3af05048ffb93f9093e591c22f334e673c2719ea23de4495f637266e5c8715",
+  "tests/data/test_websocket_generations.py": "50efce86891ebaaad0a77d91a2ed8355a80f8ffda9d1095c8cc5401468f69592",
+  "tests/data/test_websocket_reconnect.py": "f8187706d6759f3e871546755c312bbe87970126fa08da807e62a6ea5d8c260d",
+  "tests/data/test_websocket_health.py": "d14da69def7c321d01afa61f8f9caf3624aa2e0503d2445a11acbda2dd3d2550"
+}

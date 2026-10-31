@@ -1,10 +1,14 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { getStock, getCandles, backfillStock } from '@/lib/api';
+import { createTrendline, deleteTrendline, getTrendlines } from '@/lib/filter-api';
 import type { StockDetail, Candle, CandleInterval } from '@/lib/types';
+import type { TrendlineDefinition, TrendlinePoint } from '@/lib/filter-types';
+import { formatStockSymbol } from '@/lib/stock-display';
 import CandleChart from '@/components/CandleChart';
+import StockIdentity from '@/components/StockIdentity';
 
 const INTERVALS: { key: CandleInterval; label: string; days: number }[] = [
   { key: '1m', label: '1m', days: 2 },
@@ -32,6 +36,8 @@ export default function StockDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [backfilling, setBackfilling] = useState(false);
   const [backfillMsg, setBackfillMsg] = useState<string | null>(null);
+  const [trendlines, setTrendlines] = useState<TrendlineDefinition[]>([]);
+  const [drawingTrendline, setDrawingTrendline] = useState(false);
 
   // Load stock detail
   useEffect(() => {
@@ -53,6 +59,22 @@ export default function StockDetailPage() {
       .then(setCandles)
       .catch(() => setCandles([]))
       .finally(() => setChartLoading(false));
+  }, [symbol, interval]);
+
+  useEffect(() => {
+    if (!symbol) return;
+    getTrendlines(symbol, interval).then(setTrendlines).catch(() => setTrendlines([]));
+  }, [symbol, interval]);
+
+  const handleCreateTrendline = useCallback(async (points: TrendlinePoint[]) => {
+    if (!symbol) return;
+    try {
+      const trendline = await createTrendline({ symbol, interval, points, trendline_type: 'manual' });
+      setTrendlines((current) => [...current, trendline]);
+      setDrawingTrendline(false);
+    } catch (err) {
+      setBackfillMsg(`Trendline save failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
   }, [symbol, interval]);
 
   if (loading) {
@@ -91,10 +113,10 @@ export default function StockDetailPage() {
           <div>
             <span className="stock-symbol-badge">{stock.exchange}</span>
             <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-secondary)' }}>
-              {stock.symbol?.replace(/-EQ$/, '')}
+              {formatStockSymbol(stock.symbol ?? '')}
             </span>
           </div>
-          <div className="stock-name">{stock.name || stock.symbol?.replace(/-EQ$/, '')}</div>
+          <div className="stock-name"><StockIdentity className="stock-detail-identity" symbol={stock.symbol} name={stock.name} company_name={stock.company_name} sector={stock.sector} close={price} market_cap_cr={stock.market_cap_cr} as_of_date={stock.latest_candle?.timestamp} /></div>
           <div className="stock-price" style={{ color: isUp ? 'var(--color-profit)' : 'var(--color-loss)' }}>
             ₹{price.toFixed(2)}
           </div>
@@ -103,12 +125,10 @@ export default function StockDetailPage() {
           </div>
 
           <div className="stock-meta">
-            {stock.industry && (
-              <div className="stock-meta-item">
-                <span className="stock-meta-label">Sector</span>
-                <span className="stock-meta-value">{stock.sector_display || stock.industry}</span>
-              </div>
-            )}
+            <div className="stock-meta-item">
+              <span className="stock-meta-label">Sector</span>
+              <span className="stock-meta-value">{stock.sector || stock.sector_display || stock.sector_name || '—'}</span>
+            </div>
             {stock.latest_candle && (
               <>
                 <div className="stock-meta-item">
@@ -151,13 +171,16 @@ export default function StockDetailPage() {
               </button>
             ))}
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-            {candles.length.toLocaleString()} candles
-            {chartLoading && ' · Loading...'}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+              {candles.length.toLocaleString()} candles
+              {chartLoading && ' · Loading...'}
+            </div>
+            <button className={`btn ${drawingTrendline ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setDrawingTrendline((current) => !current)}>{drawingTrendline ? 'Click two points…' : 'Draw trendline'}</button>
           </div>
         </div>
         {candles.length > 0 ? (
-          <CandleChart candles={candles} height={500} />
+          <CandleChart candles={candles} height={500} trendlines={trendlines} drawingEnabled={drawingTrendline} onCreateTrendline={handleCreateTrendline} />
         ) : (
           <div className="empty-state" style={{ height: 500 }}>
             <div className="empty-state-icon">📊</div>
@@ -197,6 +220,16 @@ export default function StockDetailPage() {
           </div>
         )}
       </div>
+
+      {trendlines.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+          {trendlines.map((trendline) => (
+            <button key={trendline.id} className="btn btn-secondary" onClick={async () => { await deleteTrendline(trendline.id); setTrendlines((current) => current.filter((item) => item.id !== trendline.id)); }}>
+              Remove line #{trendline.id}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Technical Indicators */}
       {ind && (

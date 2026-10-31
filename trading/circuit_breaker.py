@@ -95,6 +95,7 @@ class CircuitBreaker:
         self._consecutive_losses: int = 0
         self._total_orders: int = 0
         self._failed_orders: int = 0
+        self._unknown_orders: int = 0   # submissions with no confirmed outcome (transport/reply problems)
         self._half_open_trades: int = 0
         self._trip_count: int = 0
 
@@ -186,10 +187,20 @@ class CircuitBreaker:
                     self.trip("Half-open recovery failed — re-halting")
 
     def record_order_failure(self) -> None:
-        """Record a failed order (API error, rejection) and check error rate."""
+        """Record a CONFIRMED failed order (broker rejection, risk rejection) and check error rate."""
         self._failed_orders += 1
         self._total_orders += 1
         self._check_error_rate_trigger()
+
+    def record_order_unknown(self) -> None:
+        """
+        Record a submission whose outcome is unknown (transport error, lost
+        or malformed reply). Kept apart from failures: it is neither a
+        rejection nor a placement until the broker's books resolve it, so it
+        does not feed the error-rate trigger. Counted for visibility.
+        """
+        self._unknown_orders += 1
+        logger.warning(f"Circuit breaker: order outcome unknown ({self._unknown_orders} today) — not counted as a failure")
 
     def trip(self, reason: str) -> None:
         """
@@ -262,6 +273,7 @@ class CircuitBreaker:
         self._consecutive_losses = 0
         self._total_orders = 0
         self._failed_orders = 0
+        self._unknown_orders = 0
         self._half_open_trades = 0
         logger.info("Circuit breaker daily counters reset")
 
@@ -315,6 +327,7 @@ class CircuitBreaker:
             "consecutive_losses": self._consecutive_losses,
             "total_orders": self._total_orders,
             "failed_orders": self._failed_orders,
+            "unknown_orders": self._unknown_orders,
             "trip_count": self._trip_count,
             "position_size_multiplier": self.get_position_size_multiplier(),
         }

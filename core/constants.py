@@ -76,6 +76,7 @@ class OrderStatus(str, Enum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     REJECTED = "REJECTED"     # Broker rejected
     CANCELLED = "CANCELLED"   # User/system cancelled
+    UNKNOWN = "UNKNOWN"       # Submission outcome unknown (timeout / unparseable reply) — may be working
 
 
 class Duration(str, Enum):
@@ -184,11 +185,13 @@ CANDLE_TABLE_SUFFIX: dict[str, str] = {
 # All candle table names for schema generation
 CANDLE_TABLES = [f"candles_{suffix}" for suffix in CANDLE_TABLE_SUFFIX.values()]
 
-# Backfill policy: how many days of history to fetch per interval
-# Angel One API max is ~2 years (~730 days)
+# Backfill policy: how many days of history to request per interval.
+# The daily lifetime window is paginated into the provider's 2000-day
+# request windows; coverage marks newer listings complete after a successful
+# full-range check so they are not fetched repeatedly on every startup.
 BACKFILL_DAYS: dict[str, int] = {
     CandleInterval.ONE_MINUTE: 7,         # 7 days (~2,625 candles/stock) — covers a full week for illiquid stocks
-    CandleInterval.FIVE_MINUTE: 90,       # 90 days (~6,750 candles/stock)
+    CandleInterval.FIVE_MINUTE: 1095,     # 3 years (~82,000 candles/stock)
     CandleInterval.FIFTEEN_MINUTE: 30,    # 30 days (~750 candles/stock)
     CandleInterval.ONE_HOUR: 90,          # 3 months (~540 candles/stock)
     CandleInterval.ONE_DAY: 7300,         # Full lifetime (~20 years, chunked into 2000-day API requests)
@@ -281,66 +284,27 @@ NSE_REQUIRED_HEADERS = {
 }
 
 
-# ── NSE Trading Calendar (powered by exchange_calendars) ─────
-# Provides accurate holiday data from 2003 onwards, covering all years.
-# Lazily initialized singleton to avoid import-time overhead.
+# ── NSE Holidays 2026 (to be updated annually) ──────────────
 
-_nse_calendar = None
-
-
-def _get_nse_calendar():
-    """Lazily load the NSE (XNSE) exchange calendar singleton."""
-    global _nse_calendar
-    if _nse_calendar is None:
-        import exchange_calendars as xcals
-        _nse_calendar = xcals.get_calendar("XBOM")
-    return _nse_calendar
-
-
-def is_nse_trading_day(d) -> bool:
-    """
-    Check if a given date is an NSE trading session.
-
-    Args:
-        d: date object or ISO date string (e.g. "2026-03-26").
-
-    Returns:
-        True if NSE was open on that day, False if weekend/holiday.
-    """
-    from datetime import date as _date
-    import pandas as pd
-
-    if isinstance(d, str):
-        d = _date.fromisoformat(d)
-
-    cal = _get_nse_calendar()
-    ts = pd.Timestamp(d)
-    return cal.is_session(ts)
-
-
-def get_nse_trading_days(start_date, end_date) -> list:
-    """
-    Get all valid NSE trading sessions between start_date and end_date (inclusive).
-
-    Args:
-        start_date: date object or ISO string.
-        end_date:   date object or ISO string.
-
-    Returns:
-        Sorted list of date objects representing valid trading days.
-    """
-    from datetime import date as _date
-    import pandas as pd
-
-    if isinstance(start_date, str):
-        start_date = _date.fromisoformat(start_date)
-    if isinstance(end_date, str):
-        end_date = _date.fromisoformat(end_date)
-
-    cal = _get_nse_calendar()
-    sessions = cal.sessions_in_range(
-        pd.Timestamp(start_date),
-        pd.Timestamp(end_date),
-    )
-    return [s.date() for s in sessions]
-
+NSE_HOLIDAYS_2026 = [
+    "2026-01-26",  # Republic Day
+    "2026-02-17",  # Mahashivratri (tentative)
+    "2026-03-10",  # Holi
+    "2026-03-30",  # Id-ul-Fitr (tentative)
+    "2026-04-02",  # Ram Navami
+    "2026-04-03",  # Good Friday (tentative)
+    "2026-04-14",  # Dr. Ambedkar Jayanti
+    "2026-05-01",  # Maharashtra Day
+    "2026-06-06",  # Bakrid (tentative)
+    "2026-07-06",  # Muharram (tentative)
+    "2026-08-15",  # Independence Day
+    "2026-08-16",  # Parsi New Year (tentative)
+    "2026-09-04",  # Milad-un-Nabi (tentative)
+    "2026-10-02",  # Mahatma Gandhi Jayanti
+    "2026-10-20",  # Dussehra
+    "2026-10-21",  # Dussehra (additional)
+    "2026-11-09",  # Diwali (Laxmi Puja)
+    "2026-11-10",  # Diwali (Balipratipada)
+    "2026-11-19",  # Guru Nanak Jayanti
+    "2026-12-25",  # Christmas
+]

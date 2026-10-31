@@ -478,6 +478,27 @@ SCHEMA_MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_candles_5m_stock_ts
         ON candles_5m(stock_id, timestamp DESC);
     """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'candles_5m_valid_ohlcv'
+              AND conrelid = 'candles_5m'::regclass
+        ) THEN
+            -- NOT VALID leaves historical rows untouched while enforcing the
+            -- invariant for every new insert or update. Legacy rows are
+            -- filtered by backtest loaders and can be cleaned separately.
+            ALTER TABLE candles_5m
+            ADD CONSTRAINT candles_5m_valid_ohlcv CHECK (
+                low > 0
+                AND volume >= 0
+                AND high >= GREATEST(open, close, low)
+                AND low <= LEAST(open, close)
+            ) NOT VALID;
+        END IF;
+    END $$;
+    """,
 
     """
     CREATE TABLE IF NOT EXISTS candles_15m (
@@ -570,6 +591,25 @@ SCHEMA_MIGRATIONS = [
         ON candle_coverage(interval);
     """,
 
+    # Coverage metadata extensions used by the resilient historical sync.
+    # history_complete distinguishes a successfully checked newer listing
+    # from a stock that is genuinely missing the requested lookback.
+    """
+    ALTER TABLE candle_coverage
+        ADD COLUMN IF NOT EXISTS history_complete BOOLEAN NOT NULL DEFAULT FALSE;
+
+    CREATE TABLE IF NOT EXISTS candle_sync_checks (
+        stock_id         INTEGER REFERENCES stocks(id) ON DELETE CASCADE,
+        interval         VARCHAR(20) NOT NULL,
+        last_checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_result      VARCHAR(20) NOT NULL DEFAULT 'data',
+        last_error       TEXT DEFAULT '',
+        PRIMARY KEY (stock_id, interval)
+    );
+    CREATE INDEX IF NOT EXISTS idx_candle_sync_checks_checked
+        ON candle_sync_checks(interval, last_checked_at DESC);
+    """,
+
     # ── Watchlists (parent: list metadata) ──
     # Each watchlist is a named collection of stocks.
     # System creates default lists like 'live_subscribe' (WebSocket),
@@ -612,6 +652,50 @@ SCHEMA_MIGRATIONS = [
         ('nse500', 'NSE 500 index stocks — default for WebSocket and scanning', 'system', 500),
         ('manual_picks', 'Manually curated stocks to watch', 'custom', 0)
     ON CONFLICT (name) DO NOTHING;
+    """,
+
+    # ── Popular index watchlists ───────────────────────────────
+    # Keep these as named index lists so they can be selected directly by
+    # watchlist analysis/backtests.  Constituents are intentionally managed
+    # as watchlist items (rather than being inferred from the list name), so
+    # a later index refresh can update membership without changing the list
+    # identity or any saved analysis configuration.
+    """
+    UPDATE watchlists
+    SET name = 'Nifty 500',
+        description = 'Nifty 500 index stocks — default large/mid/small-cap NSE universe',
+        list_type = 'index',
+        max_stocks = 500,
+        updated_at = NOW()
+    WHERE name = 'nse500'
+      AND NOT EXISTS (SELECT 1 FROM watchlists WHERE name = 'Nifty 500');
+    """,
+    """
+    INSERT INTO watchlists (name, description, list_type, max_stocks)
+    VALUES
+        ('Nifty 50', 'Nifty 50 — 50 leading NSE-listed companies', 'index', 50),
+        ('Nifty Next 50', 'Nifty Next 50 — the next 50 companies after Nifty 50', 'index', 50),
+        ('Nifty 100', 'Nifty 100 — Nifty 50 plus Nifty Next 50', 'index', 100),
+        ('Nifty 200', 'Nifty 200 — broad large and mid-cap NSE universe', 'index', 200),
+        ('Nifty 500', 'Nifty 500 — broad large, mid and small-cap NSE universe', 'index', 500),
+        ('Nifty Bank', 'Nifty Bank — leading banking stocks', 'index', 14),
+        ('Nifty Financial Services', 'Nifty Financial Services — banks, financial services and insurance', 'index', 20),
+        ('Nifty IT', 'Nifty IT — leading information technology stocks', 'index', 10),
+        ('Nifty Pharma', 'Nifty Pharma — leading pharmaceutical stocks', 'index', 20),
+        ('Nifty Auto', 'Nifty Auto — leading automobile and auto-component stocks', 'index', 15),
+        ('Nifty FMCG', 'Nifty FMCG — leading fast-moving consumer goods stocks', 'index', 15),
+        ('Nifty Metal', 'Nifty Metal — leading metal and mining stocks', 'index', 15),
+        ('Nifty Midcap 150', 'Nifty Midcap 150 — mid-cap NSE universe', 'index', 150),
+        ('Nifty Smallcap 250', 'Nifty Smallcap 250 — small-cap NSE universe', 'index', 250),
+        ('Nifty500 Momentum 50', 'Nifty500 Momentum 50 — momentum strategy index', 'index', 50),
+        ('S&P BSE Sensex', 'S&P BSE Sensex — 30 leading BSE-listed companies', 'index', 30),
+        ('S&P BSE 500', 'S&P BSE 500 — broad BSE equity universe', 'index', 500)
+    ON CONFLICT (name) DO UPDATE SET
+        description = EXCLUDED.description,
+        list_type = EXCLUDED.list_type,
+        max_stocks = EXCLUDED.max_stocks,
+        is_active = TRUE,
+        updated_at = NOW();
     """,
 
     # ── Volume Snapshots (intraday cumulative) ──
@@ -902,7 +986,21 @@ SCHEMA_MIGRATIONS = [
         ('min_avg_volume', '10000', 'int', 'filter', 'Minimum 30-day avg volume'),
         ('slippage_pct', '0.1', 'float', 'trading', 'Simulated slippage percentage'),
         ('circuit_breaker_daily_loss_pct', '3.0', 'float', 'circuit_breaker', 'Circuit breaker daily loss trigger'),
-        ('circuit_breaker_consecutive_losses', '5', 'int', 'circuit_breaker', 'Max consecutive losses before halt')
+        ('circuit_breaker_consecutive_losses', '5', 'int', 'circuit_breaker', 'Max consecutive losses before halt'),
+        ('charges_enabled', 'true', 'bool', 'trading_costs', 'Apply configured equity-delivery charges in backtests'),
+        ('charges_product_type', 'DELIVERY', 'string', 'trading_costs', 'Product type used by the charge schedule'),
+        ('charges_exchange', 'NSE', 'string', 'trading_costs', 'Exchange rates used by the charge schedule'),
+        ('charges_brokerage_rate_pct', '0.0', 'float', 'trading_costs', 'Brokerage percentage per executed delivery order'),
+        ('charges_brokerage_cap_rupees', '0.0', 'float', 'trading_costs', 'Maximum brokerage per executed delivery order'),
+        ('charges_brokerage_min_rupees', '0.0', 'float', 'trading_costs', 'Minimum brokerage per executed delivery order'),
+        ('charges_stt_buy_pct', '0.1', 'float', 'trading_costs', 'STT percentage on equity-delivery buys'),
+        ('charges_stt_sell_pct', '0.1', 'float', 'trading_costs', 'STT percentage on equity-delivery sells'),
+        ('charges_transaction_charge_pct', '0.0030699', 'float', 'trading_costs', 'NSE transaction charge percentage on turnover'),
+        ('charges_ipft_charge_pct', '0.0000001', 'float', 'trading_costs', 'NSE IPFT percentage on turnover'),
+        ('charges_stamp_duty_buy_pct', '0.015', 'float', 'trading_costs', 'Stamp duty percentage on delivery buys'),
+        ('charges_sebi_fee_per_crore', '10.0', 'float', 'trading_costs', 'SEBI turnover fee in rupees per crore'),
+        ('charges_dp_charge_per_sell_rupees', '12.5', 'float', 'trading_costs', 'DP charge per delivery sell instruction and ISIN before GST'),
+        ('charges_gst_pct', '18.0', 'float', 'trading_costs', 'GST percentage on applicable services and DP charges')
     ON CONFLICT (key) DO NOTHING;
     """,
 
@@ -925,7 +1023,7 @@ SCHEMA_MIGRATIONS = [
     );
     """,
 
-    # Seed the 3 existing algorithms
+    # Seed the built-in algorithms
     """
     INSERT INTO algorithms (name, display_name, description, strategy_type, candle_intervals, max_positions, stop_loss_pct)
     VALUES
@@ -935,6 +1033,9 @@ SCHEMA_MIGRATIONS = [
         ('rayner_dip_buyer', 'Rayner 10-Day Low Dip Buyer',
          'Buys 10-day lows at 2%% discount in uptrends (price>SMA200). Exits when close>SMA5 or 20-day time stop.',
          'positional', 'ONE_DAY', 10, 5.00),
+        ('swing_volume_profile_pullback', 'Bullish Swing Volume-Profile Pullback',
+         'Requires confirmed higher highs and higher lows, then enters after a bullish rejection from the latest swing volume-profile value area. Stop below the swing low; target 2R.',
+         'swing', 'ONE_DAY', 5, 5.00),
         ('scanner_confluence', 'Scanner Confluence',
          'Meta-algorithm: enters when 2+ scanners agree on same stock. Intraday with 3%% SL / 2%% TP.',
          'intraday', 'FIVE_MINUTE', 5, 3.00)
@@ -1020,5 +1121,537 @@ SCHEMA_MIGRATIONS = [
         metadata        JSONB DEFAULT '{}'
     );
     CREATE INDEX IF NOT EXISTS idx_bt_trades_run ON backtest_trades(run_id);
+    """,
+
+    # ── Point-in-time Enhanced Momentum scanner backtests ──
+    """
+    CREATE TABLE IF NOT EXISTS enhanced_momentum_backtest_runs (
+        id                  BIGSERIAL PRIMARY KEY,
+        signal_cutoff_date  DATE NOT NULL,
+        end_date            DATE NOT NULL,
+        lookback_months     INTEGER NOT NULL DEFAULT 3,
+        filters_json        JSONB NOT NULL DEFAULT '{}',
+        config_json         JSONB NOT NULL DEFAULT '{}',
+        summary_json        JSONB NOT NULL DEFAULT '{}',
+        scan_json           JSONB NOT NULL DEFAULT '{}',
+        results_json        JSONB NOT NULL DEFAULT '[]',
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_enhanced_momentum_backtests_created
+        ON enhanced_momentum_backtest_runs(created_at DESC);
+    """,
+
+    # Persist setup-by-setup and stock-by-stock replay details separately from
+    # the scanner's legacy flat result list.
+    """
+    ALTER TABLE enhanced_momentum_backtest_runs
+        ADD COLUMN IF NOT EXISTS strategies_json JSONB NOT NULL DEFAULT '[]';
+    """,
+
+    # Durable replay job handles. The UI polls a job id while the replay runs
+    # in a worker thread; keeping the job, its request, progress and outcome
+    # here means an API restart cannot orphan a handle the caller still holds.
+    # ``worker_id`` and ``heartbeat_at`` let a different API process tell an
+    # abandoned worker apart from one that is still running elsewhere.
+    """
+    CREATE TABLE IF NOT EXISTS enhanced_momentum_backtest_jobs (
+        job_id          VARCHAR(32) PRIMARY KEY,
+        status          VARCHAR(20) NOT NULL,
+        request_json    JSONB NOT NULL DEFAULT '{}',
+        progress_json   JSONB NOT NULL DEFAULT '{}',
+        run_id          BIGINT REFERENCES enhanced_momentum_backtest_runs(id) ON DELETE SET NULL,
+        error           TEXT,
+        worker_id       VARCHAR(120),
+        heartbeat_at    TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        started_at      TIMESTAMPTZ,
+        completed_at    TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_enhanced_momentum_backtest_jobs_status
+        ON enhanced_momentum_backtest_jobs(status, created_at DESC);
+    """,
+
+    # Admission is a single statement guarded by NOT EXISTS, but two API
+    # processes can still pass that guard concurrently under read committed.
+    # This partial unique index is what makes "at most one active replay"
+    # true in storage: the second insert fails instead of slipping through.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_enhanced_momentum_backtest_jobs_single_active
+        ON enhanced_momentum_backtest_jobs ((status IN ('queued', 'running')))
+        WHERE status IN ('queued', 'running');
+    """,
+
+    # Reverse link from a saved run back to the job that produced it, so a
+    # job whose final status write was lost can still be settled as completed.
+    # (Early form: a plain index. Upgraded to unique below.)
+    """
+    ALTER TABLE enhanced_momentum_backtest_runs
+        ADD COLUMN IF NOT EXISTS job_id VARCHAR(32);
+    CREATE INDEX IF NOT EXISTS idx_enhanced_momentum_backtests_job
+        ON enhanced_momentum_backtest_runs(job_id);
+    """,
+
+    # One saved result per job, so a result insert that committed but whose
+    # reply was lost can be retried safely (ON CONFLICT DO NOTHING, re-read)
+    # without recomputing or duplicating the replay.
+    #
+    # Environments that ran the early non-unique index keep its name, so
+    # CREATE UNIQUE INDEX IF NOT EXISTS would silently leave it non-unique.
+    # Inspect the catalog instead: if the index is missing or not the unique
+    # partial one, first unlink duplicate results (never delete them - keep
+    # the result the job points at, else the earliest), then rebuild it, and
+    # finally verify the definition rather than assume it.
+    """
+    DO $$
+    DECLARE
+        is_expected   boolean;
+        unlinked      integer;
+    BEGIN
+        -- Unique, partial on (job_id IS NOT NULL), keyed on job_id alone.
+        SELECT i.indisunique
+               AND i.indnkeyatts = 1
+               AND a.attname = 'job_id'
+               AND pg_get_expr(i.indpred, i.indrelid) = '(job_id IS NOT NULL)'
+        INTO is_expected
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+        WHERE n.nspname = current_schema()
+          AND c.relname = 'idx_enhanced_momentum_backtests_job';
+
+        IF NOT COALESCE(is_expected, false) THEN
+            WITH keeper AS (
+                SELECT r.job_id,
+                       COALESCE(
+                           (SELECT j.run_id
+                            FROM enhanced_momentum_backtest_jobs j
+                            WHERE j.job_id = r.job_id
+                              AND j.run_id IN (SELECT k.id FROM enhanced_momentum_backtest_runs k
+                                               WHERE k.job_id = r.job_id)),
+                           MIN(r.id)
+                       ) AS keep_id
+                FROM enhanced_momentum_backtest_runs r
+                WHERE r.job_id IS NOT NULL
+                GROUP BY r.job_id
+                HAVING COUNT(*) > 1
+            )
+            UPDATE enhanced_momentum_backtest_runs r
+            SET job_id = NULL
+            FROM keeper
+            WHERE r.job_id = keeper.job_id AND r.id <> keeper.keep_id;
+            GET DIAGNOSTICS unlinked = ROW_COUNT;
+            IF unlinked > 0 THEN
+                RAISE NOTICE 'Unlinked % duplicate enhanced momentum result(s) from their job; the results themselves are kept', unlinked;
+            END IF;
+
+            DROP INDEX IF EXISTS idx_enhanced_momentum_backtests_job;
+            CREATE UNIQUE INDEX idx_enhanced_momentum_backtests_job
+                ON enhanced_momentum_backtest_runs(job_id)
+                WHERE job_id IS NOT NULL;
+        END IF;
+
+        SELECT i.indisunique
+               AND i.indnkeyatts = 1
+               AND a.attname = 'job_id'
+               AND pg_get_expr(i.indpred, i.indrelid) = '(job_id IS NOT NULL)'
+        INTO is_expected
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+        WHERE n.nspname = current_schema()
+          AND c.relname = 'idx_enhanced_momentum_backtests_job';
+        IF NOT COALESCE(is_expected, false) THEN
+            RAISE EXCEPTION 'idx_enhanced_momentum_backtests_job is not the expected unique partial index on job_id';
+        END IF;
+    END $$;
+    """,
+
+    # Caller-supplied submission identity. Retrying a submission whose reply
+    # was lost must find the original job (and its outcome) instead of
+    # starting another replay; the fingerprint lets a reused identity with
+    # different parameters be rejected. The unique index makes a concurrent
+    # retry from two processes converge on one job.
+    """
+    ALTER TABLE enhanced_momentum_backtest_jobs
+        ADD COLUMN IF NOT EXISTS submission_id VARCHAR(64),
+        ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_enhanced_momentum_backtest_jobs_submission
+        ON enhanced_momentum_backtest_jobs(submission_id)
+        WHERE submission_id IS NOT NULL;
+    """,
+
+    # ── Modular filter profiles and immutable versions ──
+    """
+    CREATE TABLE IF NOT EXISTS filter_profiles (
+        id              SERIAL PRIMARY KEY,
+        name            VARCHAR(120) NOT NULL,
+        description     TEXT DEFAULT '',
+        mode            VARCHAR(20) NOT NULL DEFAULT 'screen',
+        owner_id        VARCHAR(120),
+        is_active       BOOLEAN DEFAULT TRUE,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_filter_profiles_active
+        ON filter_profiles(is_active, updated_at DESC);
+    """,
+
+    """
+    CREATE TABLE IF NOT EXISTS filter_profile_versions (
+        id                  SERIAL PRIMARY KEY,
+        profile_id          INTEGER NOT NULL REFERENCES filter_profiles(id) ON DELETE CASCADE,
+        version_number      INTEGER NOT NULL,
+        status              VARCHAR(20) NOT NULL DEFAULT 'draft',
+        schema_version      INTEGER NOT NULL DEFAULT 1,
+        expression_json     JSONB NOT NULL DEFAULT '{}',
+        requirements_json   JSONB NOT NULL DEFAULT '{}',
+        risk_config_json    JSONB NOT NULL DEFAULT '{}',
+        timeframe_config_json JSONB NOT NULL DEFAULT '{}',
+        created_at          TIMESTAMPTZ DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ DEFAULT NOW(),
+        published_at        TIMESTAMPTZ,
+        UNIQUE(profile_id, version_number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_filter_profile_versions_status
+        ON filter_profile_versions(profile_id, status, version_number DESC);
+    """,
+
+    """
+    CREATE TABLE IF NOT EXISTS filter_profile_bindings (
+        id              SERIAL PRIMARY KEY,
+        profile_id      INTEGER NOT NULL REFERENCES filter_profiles(id) ON DELETE CASCADE,
+        version_id      INTEGER NOT NULL REFERENCES filter_profile_versions(id) ON DELETE RESTRICT,
+        target_type     VARCHAR(30) NOT NULL,
+        target_id       VARCHAR(120) NOT NULL,
+        direction       VARCHAR(10) NOT NULL DEFAULT 'BUY',
+        enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(target_type, target_id, direction)
+    );
+    CREATE INDEX IF NOT EXISTS idx_filter_profile_bindings_profile
+        ON filter_profile_bindings(profile_id, enabled);
+    CREATE INDEX IF NOT EXISTS idx_filter_profile_bindings_target
+        ON filter_profile_bindings(target_type, target_id, direction);
+    """,
+
+    """
+    CREATE TABLE IF NOT EXISTS filter_evaluations (
+        id              BIGSERIAL PRIMARY KEY,
+        profile_id      INTEGER REFERENCES filter_profiles(id) ON DELETE SET NULL,
+        version_id      INTEGER REFERENCES filter_profile_versions(id) ON DELETE SET NULL,
+        symbol          VARCHAR(30) NOT NULL,
+        mode            VARCHAR(20) NOT NULL,
+        as_of           TIMESTAMPTZ NOT NULL,
+        status          VARCHAR(30) NOT NULL,
+        score           NUMERIC(8,5) DEFAULT 0,
+        result_json     JSONB NOT NULL DEFAULT '{}',
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_filter_evaluations_lookup
+        ON filter_evaluations(profile_id, version_id, symbol, as_of DESC);
+    """,
+
+    # ── User-drawn chart trendlines ──────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS trendline_definitions (
+        id              SERIAL PRIMARY KEY,
+        symbol          VARCHAR(30) NOT NULL,
+        interval        VARCHAR(10) NOT NULL,
+        points_json     JSONB NOT NULL,
+        trendline_type  VARCHAR(30) NOT NULL DEFAULT 'support',
+        source          VARCHAR(30) NOT NULL DEFAULT 'manual',
+        name            VARCHAR(120),
+        active          BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_trendlines_symbol_interval
+        ON trendline_definitions(symbol, interval, active);
+    """,
+
+    # ── Backtests executed from immutable filter profile versions ──
+    """
+    CREATE TABLE IF NOT EXISTS filter_backtest_runs (
+        id                  BIGSERIAL PRIMARY KEY,
+        profile_id          INTEGER NOT NULL REFERENCES filter_profiles(id) ON DELETE CASCADE,
+        version_id          INTEGER NOT NULL REFERENCES filter_profile_versions(id) ON DELETE RESTRICT,
+        symbol              VARCHAR(30) NOT NULL,
+        start_date          TIMESTAMPTZ NOT NULL,
+        end_date            TIMESTAMPTZ NOT NULL,
+        initial_capital     NUMERIC(16,2) NOT NULL,
+        status              VARCHAR(20) NOT NULL DEFAULT 'completed',
+        config_json         JSONB NOT NULL DEFAULT '{}',
+        result_json         JSONB NOT NULL DEFAULT '{}',
+        error_message       TEXT DEFAULT '',
+        created_at          TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_filter_backtest_runs_profile
+        ON filter_backtest_runs(profile_id, created_at DESC);
+    """,
+    """
+    ALTER TABLE filter_backtest_runs
+        ALTER COLUMN profile_id DROP NOT NULL,
+        ALTER COLUMN version_id DROP NOT NULL;
+    ALTER TABLE filter_backtest_runs
+        ADD COLUMN IF NOT EXISTS preset_id VARCHAR(80),
+        ADD COLUMN IF NOT EXISTS preset_name VARCHAR(160);
+    CREATE INDEX IF NOT EXISTS idx_filter_backtest_runs_preset
+        ON filter_backtest_runs(preset_id, created_at DESC);
+    """,
+    """
+    ALTER TABLE backtest_runs
+        ADD COLUMN IF NOT EXISTS total_charges NUMERIC(14,2) DEFAULT 0;
+    """,
+    # ── Upstox Fundamentals identity and durable snapshots ──
+    # Fundamentals are keyed by ISIN, not by broker symbol.  Keep the mapping
+    # on the existing stock master so every downstream consumer can join it.
+    """
+    ALTER TABLE stocks ADD COLUMN IF NOT EXISTS isin VARCHAR(12);
+    ALTER TABLE stocks ADD COLUMN IF NOT EXISTS upstox_instrument_key VARCHAR(80);
+    ALTER TABLE stocks ADD COLUMN IF NOT EXISTS isin_updated_at TIMESTAMPTZ;
+    -- Multiple NSE series rows (for example EQ and BE) may share one ISIN.
+    -- Keep ISIN searchable, but do not require it to be unique per stock row.
+    DROP INDEX IF EXISTS idx_stocks_isin;
+    CREATE INDEX IF NOT EXISTS idx_stocks_isin_lookup
+        ON stocks(isin) WHERE isin IS NOT NULL AND isin <> '';
+    CREATE INDEX IF NOT EXISTS idx_stocks_upstox_instrument
+        ON stocks(upstox_instrument_key);
+    """,
+    # ── Fundamentals sync runs ──
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_sync_runs (
+        id                  BIGSERIAL PRIMARY KEY,
+        source              VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        finished_at         TIMESTAMPTZ,
+        status              VARCHAR(20) NOT NULL DEFAULT 'running',
+        requested_stocks    INTEGER NOT NULL DEFAULT 0,
+        processed_stocks    INTEGER NOT NULL DEFAULT 0,
+        successful_requests INTEGER NOT NULL DEFAULT 0,
+        failed_requests     INTEGER NOT NULL DEFAULT 0,
+        skipped_stocks      INTEGER NOT NULL DEFAULT 0,
+        details             JSONB NOT NULL DEFAULT '{}',
+        error_message       TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_fundamental_sync_runs_started
+        ON fundamental_sync_runs(started_at DESC);
+    """,
+    # ── Per-stock/per-endpoint sync state ──
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_sync_state (
+        stock_id              INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        endpoint              VARCHAR(40) NOT NULL,
+        last_attempted_at     TIMESTAMPTZ,
+        last_success_at       TIMESTAMPTZ,
+        next_due_at           TIMESTAMPTZ,
+        last_status            VARCHAR(20) NOT NULL DEFAULT 'never',
+        consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+        last_payload_hash     VARCHAR(64),
+        last_error             TEXT DEFAULT '',
+        PRIMARY KEY (stock_id, endpoint)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fundamental_sync_due
+        ON fundamental_sync_state(endpoint, next_due_at);
+    """,
+    # ── Raw endpoint payloads ──
+    # Raw responses are retained by snapshot date for auditability and
+    # point-in-time research.  Normalized tables below are query-friendly.
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_raw_snapshots (
+        id              BIGSERIAL PRIMARY KEY,
+        stock_id        INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source          VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        endpoint        VARCHAR(40) NOT NULL,
+        snapshot_date   DATE NOT NULL,
+        fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        http_status     INTEGER,
+        payload_hash    VARCHAR(64) NOT NULL,
+        status          VARCHAR(20) NOT NULL DEFAULT 'success',
+        error_message   TEXT DEFAULT '',
+        payload         JSONB NOT NULL DEFAULT '{}',
+        UNIQUE(stock_id, source, endpoint, snapshot_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fundamental_raw_lookup
+        ON fundamental_raw_snapshots(stock_id, endpoint, snapshot_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_fundamental_raw_asof
+        ON fundamental_raw_snapshots(endpoint, fetched_at DESC, stock_id)
+        WHERE status = 'success';
+    """,
+    # ── Normalized company profile snapshots ──
+    """
+    CREATE TABLE IF NOT EXISTS company_fundamental_profiles (
+        id                    BIGSERIAL PRIMARY KEY,
+        stock_id              INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source                VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        snapshot_date         DATE NOT NULL,
+        isin                  VARCHAR(12) NOT NULL,
+        company_profile       TEXT DEFAULT '',
+        sector                VARCHAR(200) DEFAULT '',
+        sector_market_cap_inr NUMERIC(20,2),
+        sector_market_cap_usd NUMERIC(20,2),
+        fetched_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        payload_hash          VARCHAR(64) NOT NULL,
+        raw_snapshot_id       BIGINT REFERENCES fundamental_raw_snapshots(id) ON DELETE SET NULL,
+        UNIQUE(stock_id, source, snapshot_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_profiles_latest
+        ON company_fundamental_profiles(stock_id, snapshot_date DESC);
+    """,
+    # ── Normalized financial statement line items ──
+    """
+    CREATE TABLE IF NOT EXISTS company_fundamental_lines (
+        id              BIGSERIAL PRIMARY KEY,
+        stock_id        INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source          VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        statement_kind  VARCHAR(20) NOT NULL,
+        statement_type  VARCHAR(20) NOT NULL DEFAULT 'consolidated',
+        frequency       VARCHAR(20) NOT NULL DEFAULT 'yearly',
+        period_label    VARCHAR(40) NOT NULL,
+        period_end      DATE,
+        metric_name     VARCHAR(120) NOT NULL,
+        value           NUMERIC(24,6),
+        change_pct      NUMERIC(24,6),
+        unit            VARCHAR(20) NOT NULL DEFAULT 'crore',
+        fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        raw_snapshot_id BIGINT REFERENCES fundamental_raw_snapshots(id) ON DELETE SET NULL,
+        UNIQUE(stock_id, source, statement_kind, statement_type, frequency,
+               period_label, metric_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_fundamental_lines_lookup
+        ON company_fundamental_lines(stock_id, statement_kind, period_end DESC);
+    """,
+    """
+    -- Reported period-over-period deltas can be very large when the prior
+    -- period is near zero; preserve the provider value without overflowing.
+    ALTER TABLE company_fundamental_lines
+        ALTER COLUMN change_pct TYPE NUMERIC(24,6);
+    """,
+    # ── Ratio snapshots ──
+    """
+    CREATE TABLE IF NOT EXISTS company_fundamental_ratios (
+        id              BIGSERIAL PRIMARY KEY,
+        stock_id        INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source          VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        snapshot_date   DATE NOT NULL,
+        ratio_name      VARCHAR(40) NOT NULL,
+        company_value   NUMERIC(24,8),
+        sector_value    NUMERIC(24,8),
+        company_raw     VARCHAR(80),
+        sector_raw      VARCHAR(80),
+        fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        raw_snapshot_id BIGINT REFERENCES fundamental_raw_snapshots(id) ON DELETE SET NULL,
+        UNIQUE(stock_id, source, snapshot_date, ratio_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_ratios_latest
+        ON company_fundamental_ratios(stock_id, ratio_name, snapshot_date DESC);
+    """,
+    # ── Quarterly shareholding history ──
+    """
+    CREATE TABLE IF NOT EXISTS company_shareholding_history (
+        id              BIGSERIAL PRIMARY KEY,
+        stock_id        INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source          VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        category        VARCHAR(40) NOT NULL,
+        period_label    VARCHAR(40) NOT NULL,
+        period_end      DATE,
+        percentage      NUMERIC(12,6),
+        fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        raw_snapshot_id BIGINT REFERENCES fundamental_raw_snapshots(id) ON DELETE SET NULL,
+        UNIQUE(stock_id, source, category, period_label)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_shareholding_history
+        ON company_shareholding_history(stock_id, period_end DESC);
+    """,
+    # ── Corporate actions ──
+    """
+    CREATE TABLE IF NOT EXISTS company_corporate_actions (
+        id               BIGSERIAL PRIMARY KEY,
+        stock_id         INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source           VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        event_key        VARCHAR(64) NOT NULL,
+        action_type      VARCHAR(40) NOT NULL,
+        effective_date   DATE,
+        announcement_date DATE,
+        record_date      DATE,
+        amount           NUMERIC(24,8),
+        ratio            VARCHAR(80),
+        details          JSONB NOT NULL DEFAULT '{}',
+        fetched_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        raw_snapshot_id  BIGINT REFERENCES fundamental_raw_snapshots(id) ON DELETE SET NULL,
+        UNIQUE(stock_id, source, event_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_corporate_actions_dates
+        ON company_corporate_actions(stock_id, effective_date DESC);
+    """,
+    # ── Competitor snapshots ──
+    """
+    CREATE TABLE IF NOT EXISTS company_competitors (
+        id                    BIGSERIAL PRIMARY KEY,
+        stock_id              INTEGER NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+        source                VARCHAR(30) NOT NULL DEFAULT 'upstox',
+        snapshot_date         DATE NOT NULL,
+        competitor_isin       VARCHAR(12),
+        competitor_instrument_key VARCHAR(80) NOT NULL,
+        company_profile       TEXT DEFAULT '',
+        sector                VARCHAR(200) DEFAULT '',
+        sector_market_cap_inr NUMERIC(20,2),
+        sector_market_cap_usd NUMERIC(20,2),
+        fetched_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        raw_snapshot_id       BIGINT REFERENCES fundamental_raw_snapshots(id) ON DELETE SET NULL,
+        UNIQUE(stock_id, source, snapshot_date, competitor_instrument_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_competitors_lookup
+        ON company_competitors(stock_id, snapshot_date DESC);
+    """,
+    # Saved fundamental screens keep an editable version. Every backtest also
+    # stores a full copy of its rules so later edits cannot rewrite history.
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_queries (
+        id          BIGSERIAL PRIMARY KEY,
+        name        VARCHAR(120) NOT NULL,
+        version     INTEGER NOT NULL DEFAULT 1,
+        rules       JSONB NOT NULL,
+        is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_fundamental_queries_active
+        ON fundamental_queries(is_active, updated_at DESC);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_query_backtest_runs (
+        id          UUID PRIMARY KEY,
+        query_id    BIGINT REFERENCES fundamental_queries(id) ON DELETE SET NULL,
+        query_snapshot JSONB NOT NULL,
+        request_json JSONB NOT NULL,
+        status      VARCHAR(20) NOT NULL,
+        result_json JSONB,
+        error       TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_fundamental_query_backtest_runs_created
+        ON fundamental_query_backtest_runs(created_at DESC);
+    """,
+    """
+    -- Migrate the original named schedule once; keep later user edits intact.
+    UPDATE app_config
+    SET value = '0.0'
+    WHERE key IN ('charges_brokerage_rate_pct', 'charges_brokerage_cap_rupees', 'charges_brokerage_min_rupees')
+      AND EXISTS (
+          SELECT 1 FROM app_config
+          WHERE key = 'charges_broker_name' AND value = 'Angel One SmartAPI'
+      );
+    UPDATE app_config
+    SET value = '12.5'
+    WHERE key = 'charges_dp_charge_per_sell_rupees'
+      AND EXISTS (
+          SELECT 1 FROM app_config
+          WHERE key = 'charges_broker_name' AND value = 'Angel One SmartAPI'
+      );
+    DELETE FROM app_config WHERE key = 'charges_broker_name';
     """,
 ]

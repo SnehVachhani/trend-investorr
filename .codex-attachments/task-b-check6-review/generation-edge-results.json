@@ -1,0 +1,15 @@
+[
+  {
+    "case": "old connect creates WebSocketApp only after stop returned and replacement started",
+    "live_connections": 1,
+    "old_thread_alive": false,
+    "old_close_requests": 3,
+    "ignored_old_callbacks": 2
+  },
+  {
+    "case": "old data callback passes initial generation check, pauses parsing, resumes after replacement",
+    "delivered_prices": [],
+    "current_generation": 2,
+    "stale_ticks_dropped": 1
+  }
+]

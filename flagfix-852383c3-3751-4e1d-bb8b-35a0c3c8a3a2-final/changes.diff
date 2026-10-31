@@ -1,0 +1,3100 @@
+diff --git a/AlgoAnalystBackend/data/streams/websocket_manager.py b/AlgoAnalystBackend/data/streams/websocket_manager.py
+index 847964e..2bcfb3c 100644
+--- a/AlgoAnalystBackend/data/streams/websocket_manager.py
++++ b/AlgoAnalystBackend/data/streams/websocket_manager.py
+@@ -4,8 +4,9 @@ Trend-Investorr: WebSocket Live Data Stream Manager
+ Manages real-time market data streaming via Angel One SmartAPI WebSocket.
+ 
+ Architecture:
+-    - Up to 3 concurrent WebSocket connections (SmartAPI limit)
+-    - Each connection can subscribe to 1000 tokens (SmartAPI limit)
++    - One WebSocket connection (SmartAPI allows up to 3; this manager
++      creates exactly one, so capacity is the single-connection limit)
++    - A connection can subscribe to 1000 tokens (SmartAPI limit)
+     - Token rotation: subscribe/unsubscribe dynamically based on scanner needs
+     - Auto-reconnect with exponential backoff on disconnection
+     - Thread-safe tick buffer for consumer processing
+@@ -15,6 +16,65 @@ Feed Modes:
+     QUOTE (2):     Full quote snapshot — bid/ask, volume, OHLC
+     SNAP_QUOTE (3): Full snapshot + depth — most data
+ 
++Reconnect / resubscribe ownership
++---------------------------------
++Verified against the SDK the project installs — smartapi-python 1.5.5
++(``SmartApi/smartWebSocketV2.py``) on websocket-client 1.9.2
++(``websocket/_app.py``; pinned by requirements.txt, not declared by the
++SDK) — by driving the real classes' callbacks offline:
++
++  * ``SmartWebSocketV2.connect()`` blocks in ``WebSocketApp.run_forever()``
++    and RETURNS NORMALLY on handshake refusal, transport error and clean
++    close alike. run_forever swallows the exception, calls ``on_error``,
++    then ``teardown()``. A normal return from connect() is therefore
++    "the connection is gone", never "success".
++  * ``SmartWebSocketV2._on_close(self, wsapp)`` cannot accept websocket-
++    client's ``(wsapp, status_code, msg)``: it raises TypeError inside
++    ``WebSocketApp._callback``, which logs it and forwards it to
++    ``on_error``. The user-level ``on_close`` hook is never invoked in
++    practice; every closure surfaces through ``on_error``.
++  * ``SmartWebSocketV2._on_error`` is the SDK's own retry loop: while
++    ``current_retry_attempt < max_retry_attempt`` (default 1) it
++    ``time.sleep(retry_delay=10)`` inside the callback, ``close_connection()``s
++    and calls ``connect()`` recursively. Once exhausted it calls
++    ``on_error("Max retry attempt reached", "Connection closed")``.
++  * ``SmartWebSocketV2._on_open`` calls ``resubscribe()`` instead of the
++    user's ``on_open`` whenever ``RESUBSCRIBE_FLAG`` is set (any earlier
++    subscribe on that instance without an intervening close_connection()).
++    ``resubscribe()`` replays ``input_request_dict``, which ``unsubscribe()``
++    never prunes — a replay restores tokens the caller cancelled.
++
++  * Heartbeat: ``connect()`` passes ``ping_interval=10`` but no
++    ``ping_timeout``, so websocket-client sends a ping frame every 10 s and
++    never checks for a pong. A connection that stops responding (half-open
++    TCP) therefore produces NO close callback; the socket thread blocks in
++    recv. websocket-client does record ``wsapp.last_pong_tm`` on every pong
++    frame. The SDK's own ``last_pong_timestamp`` is never set in practice:
++    its ``_on_pong`` only accepts a pong whose payload is "ping", but the
++    ping payload is empty, and the text path that could set it
++    (``_on_message``) is not registered with WebSocketApp.
++
++Decisions taken here so that only one loop recovers and only one party
++decides what is subscribed:
++
++  * The manager owns reconnect. Every SDK client is built with
++    ``max_retry_attempt=0`` so the SDK never sleeps or reconnects inside a
++    callback; every outcome comes back as connect() returning and is handled
++    by ``_run()`` under one bounded, backed-off policy.
++  * The manager owns replay. A fresh ``SmartWebSocketV2`` is built for every
++    attempt (``RESUBSCRIBE_FLAG`` False, empty ``input_request_dict``) and
++    ``connect()`` is never called twice on one instance, so ``resubscribe()``
++    is unreachable. ``_on_open`` sends exactly the current requested set.
++  * ``on_close`` is wired but not relied upon. The authoritative "connection
++    ended" signal is connect() returning (plus ``on_error``).
++  * The manager owns liveness. A monitor thread per socket generation
++    treats the most recent of {socket opened, last tick, wsapp.last_pong_tm}
++    as evidence; no evidence for HEARTBEAT_TIMEOUT retires the generation
++    and closes the client, which makes connect() return and hands recovery
++    to the same bounded policy. While healthy, the monitor also re-runs the
++    subscription sync so a failed change is retried without waiting for the
++    next subscribe()/unsubscribe() call.
++
+ Raises:
+     WebSocketError: On connection failure after all retries.
+     SessionExpiredError: If feed token is invalid.
+@@ -36,7 +96,6 @@ from core.constants import (
+     FeedMode,
+     IST,
+     SMARTAPI_MAX_TOKENS_PER_CONNECTION,
+-    SMARTAPI_MAX_WEBSOCKET_CONNECTIONS,
+ )
+ from core.exceptions import WebSocketError, SessionExpiredError
+ from core.security.audit import AuditTrail
+@@ -47,6 +106,18 @@ from data.models.market_data import Tick
+ TickCallback = Callable[[Tick], None]
+ 
+ 
++class _Monitor:
++    """Health monitor bound to one socket generation."""
++
++    __slots__ = ("gen", "client", "stop", "thread")
++
++    def __init__(self, gen: int, client: Any):
++        self.gen = gen
++        self.client = client
++        self.stop = threading.Event()
++        self.thread: threading.Thread | None = None
++
++
+ class WebSocketManager:
+     """
+     Manages SmartAPI WebSocket connections for live market data.
+@@ -62,16 +133,30 @@ class WebSocketManager:
+     Usage:
+         ws_mgr = WebSocketManager(session, audit)
+         ws_mgr.on_tick(callback_fn)        # Register tick handler
+-        ws_mgr.subscribe(["2885", "5900"])  # Subscribe to tokens
++        ws_mgr.subscribe(["2885", "5900"])  # Record request; sent on open
+         ws_mgr.start()                     # Start streaming
+         ...
+         ws_mgr.stop()                      # Graceful shutdown
+     """
+ 
+-    # Reconnection config
++    # Reconnection config (the manager's loop; the SDK's own retry is off)
+     MAX_RECONNECT_ATTEMPTS = 5
+-    INITIAL_RECONNECT_DELAY = 1.0  # seconds
+-    MAX_RECONNECT_DELAY = 60.0     # seconds
++    INITIAL_RECONNECT_DELAY = 1.0      # seconds, doubles per consecutive failure
++    MAX_RECONNECT_DELAY = 60.0         # seconds
++    STABLE_CONNECTION_SECONDS = 30.0   # evidence must keep arriving this long to reset the budget
++    SESSION_EXPIRED_WAIT = 5.0         # seconds between checks while re-auth runs
++    MAX_SESSION_EXPIRED_WAIT = 300.0   # give up waiting for credentials after this long
++    STOP_JOIN_TIMEOUT = 5.0            # seconds stop() waits for the run thread, per try
++    MONITOR_JOIN_TIMEOUT = 5.0         # seconds stop() waits for each health monitor thread
++
++    # Health monitoring (per socket generation; see module docstring)
++    HEALTH_CHECK_INTERVAL = 5.0        # seconds between checks / pending-change retries
++    HEARTBEAT_TIMEOUT = 45.0           # no pong, no tick for this long -> silent failure
++                                       # (websocket-client pings every 10 s: >4 missed pongs)
++
++    # Version of the SDK whose behaviour the reconnect policy is written
++    # against (see module docstring). Bump only after re-verifying it.
++    VERIFIED_SDK_VERSION = "smartapi-python 1.5.5 / websocket-client 1.9.2"
+ 
+     # Tick buffer config
+     TICK_BUFFER_SIZE = 10_000       # Max ticks in buffer before backpressure
+@@ -92,18 +177,71 @@ class WebSocketManager:
+         self._audit = audit
+         self._feed_mode = feed_mode
+ 
++        # Identity. Every start() is a *run* (one thread, one retry loop);
++        # every SDK client built is a *socket generation*. Shared state may
++        # only be changed by the current run / the current generation, so a
++        # retired run finishing late, or a retired socket's delayed callback,
++        # cannot touch a replacement. All of it is guarded by _sub_lock.
++        self._run_id = 0                              # id of the latest run
++        self._socket_gen = 0                          # last generation handed out
++        self._current_gen: int | None = None          # generation of the attached socket
++        self._opened_gen: int | None = None           # generation whose on_open last fired
++
+         # Connection state
+-        self._ws: Any = None                          # SmartWebSocket instance
++        self._ws: Any = None                          # current SmartWebSocketV2 (one per attempt)
+         self._is_running = False
+         self._is_connected = False
+-        self._reconnect_count = 0
++        self._reconnect_count = 0                     # consecutive recovery attempts
++        self._reconnect_exhausted = False
++        self._connections_opened = 0
++        self._last_disconnect_reason: str | None = None
++        self._waiting_for_session = False             # blocked on missing credentials
++        self._session_wait_s = 0.0                    # how long, on the current run
++        self._stale_callbacks_ignored = 0
++        self._stale_ticks_dropped = 0
++
++        # Health monitoring. One monitor per socket generation, stopped the
++        # moment that generation is retired. Evidence timestamps use
++        # _clock (time.time, the same clock websocket-client stamps
++        # wsapp.last_pong_tm with); tests substitute a controlled clock.
++        self._clock: Callable[[], float] = time.time
++        self._monitor: _Monitor | None = None         # monitor of the current generation
++        self._monitors: list[_Monitor] = []           # every monitor not yet known to have exited
++        self._opened_epoch: float = 0.0               # current generation's open time
++        self._last_tick_epoch: float = 0.0
++        self._silent_failures = 0
++        self._subscription_retries = 0
++        self._stop_event = threading.Event()          # per run; wakes the backoff wait
+         self._ws_thread: threading.Thread | None = None
+ 
+-        # Subscription state
+-        self._subscribed_tokens: set[str] = set()
+-        self._pending_subscribes: set[str] = set()
+-        self._pending_unsubscribes: set[str] = set()
+-        self._sub_lock = threading.Lock()
++        # Subscription state (all guarded by _sub_lock)
++        #
++        #   _requested_tokens  The latest set the caller wants streamed. This
++        #                      is the source of truth: subscribe()/unsubscribe()
++        #                      update it immediately, connected or not.
++        #
++        #   _sent_tokens       Tokens whose subscribe request was handed to the
++        #                      SDK without error on the *current* connection.
++        #                      "Sent" is not "acknowledged" — SmartWebSocketV2
++        #                      surfaces no subscription ack, so this is the
++        #                      strongest claim the manager can make. Reset on
++        #                      every open/close because a new socket starts
++        #                      with nothing subscribed.
++        #
++        # The socket is brought in line with _requested_tokens by
++        # _sync_locked(), which sends the diff (requested - sent to subscribe,
++        # sent - requested to unsubscribe). A rejected request leaves the diff
++        # untouched, so it is retried on the next change or the next open.
++        self._requested_tokens: set[str] = set()
++        self._sent_tokens: set[str] = set()
++        # Re-entrant: lifecycle sections call _mark_disconnected() while held.
++        self._sub_lock = threading.RLock()
++        # Fences tick publication against retirement: a tick is buffered and
++        # delivered only while holding this and only if its socket generation
++        # is still current; retiring a generation takes it first, so it waits
++        # for an in-flight delivery and nothing from that generation can be
++        # published afterwards. Lock order: _delivery_lock -> _sub_lock.
++        self._delivery_lock = threading.RLock()
+ 
+         # Tick processing
+         self._tick_buffer: deque[Tick] = deque(maxlen=self.TICK_BUFFER_SIZE)
+@@ -133,91 +271,129 @@ class WebSocketManager:
+         """
+         Subscribe to live data for the given instrument tokens.
+ 
+-        Can be called before or after start(). If called before,
+-        tokens are queued and subscribed on connection.
++        Can be called before or after start(). The tokens are recorded as
++        requested immediately; the request is sent to the socket now if one
++        is open, otherwise when the connection opens.
+ 
+         Args:
+             tokens: List of SmartAPI instrument tokens.
+ 
+         Raises:
+-            WebSocketError: If total subscriptions exceed SmartAPI limits.
++            WebSocketError: If the requested set would exceed the
++                single-connection SmartAPI limit. The call is rejected as a
++                whole and the previously requested set is left unchanged.
+         """
+         with self._sub_lock:
+-            new_tokens = set(tokens) - self._subscribed_tokens
+-            total = len(self._subscribed_tokens) + len(new_tokens)
++            # Capacity is counted over distinct *requested* tokens — pending
++            # (not yet sent) and sent alike. Tokens already requested cost
++            # nothing, so repeated requests can never push over the limit.
++            new_tokens = set(tokens) - self._requested_tokens
++            total = len(self._requested_tokens) + len(new_tokens)
+ 
+-            max_allowed = SMARTAPI_MAX_TOKENS_PER_CONNECTION * SMARTAPI_MAX_WEBSOCKET_CONNECTIONS
++            max_allowed = SMARTAPI_MAX_TOKENS_PER_CONNECTION   # one connection
+             if total > max_allowed:
+                 raise WebSocketError(
+                     f"Cannot subscribe to {total} tokens — "
+-                    f"SmartAPI limit is {max_allowed} "
+-                    f"({SMARTAPI_MAX_WEBSOCKET_CONNECTIONS} connections × "
+-                    f"{SMARTAPI_MAX_TOKENS_PER_CONNECTION} tokens each)",
++                    f"SmartAPI limit is {max_allowed} per connection "
++                    f"and this manager holds a single connection",
+                     details={"requested": total, "limit": max_allowed},
+                 )
+ 
+-            if self._is_connected and self._ws:
+-                self._do_subscribe(list(new_tokens))
+-            else:
+-                self._pending_subscribes.update(new_tokens)
+-
+-            logger.info(f"Subscribed to {len(new_tokens)} new tokens (total: {total})")
++            self._requested_tokens |= new_tokens
++            logger.info(f"Subscription requested for {len(new_tokens)} new tokens (total: {total})")
++            self._sync_locked()
+ 
+     def unsubscribe(self, tokens: list[str]) -> None:
+         """
+         Unsubscribe from live data for the given tokens.
+ 
++        Removes the tokens from the requested set immediately. If a request
++        for them was already sent on the open socket, an unsubscribe is sent
++        now; if not (still offline, or the earlier send failed), there is
++        nothing on the wire to undo and they simply will not be sent.
++
+         Args:
+             tokens: List of SmartAPI instrument tokens to remove.
+         """
+         with self._sub_lock:
+-            tokens_to_remove = set(tokens) & self._subscribed_tokens
+-
+-            if self._is_connected and self._ws:
+-                self._do_unsubscribe(list(tokens_to_remove))
+-            else:
+-                self._pending_unsubscribes.update(tokens_to_remove)
+-
+-            self._subscribed_tokens -= tokens_to_remove
+-            logger.info(f"Unsubscribed from {len(tokens_to_remove)} tokens")
++            removed = set(tokens) & self._requested_tokens
++            self._requested_tokens -= removed
++            logger.info(f"Subscription cancelled for {len(removed)} tokens")
++            self._sync_locked()
+ 
+     def start(self) -> None:
+         """
+         Start the WebSocket connection in a background thread.
+ 
+         Non-blocking: returns immediately, streaming happens in background.
+-
+-        Raises:
+-            WebSocketError: If connection cannot be established.
++        Idempotent while running. May be called again after stop() or after
++        the reconnect budget was exhausted — even if the previous run's
++        thread is still finishing its last connect(): that run is retired
++        and can no longer change shared state.
+         """
+-        if self._is_running:
+-            logger.warning("WebSocket manager already running")
+-            return
++        with self._sub_lock:
++            if self._is_running:
++                logger.warning("WebSocket manager already running")
++                return
+ 
+-        self._is_running = True
+-        self._ws_thread = threading.Thread(
+-            target=self._run,
+-            name="ws-stream",
+-            daemon=True,
+-        )
+-        self._ws_thread.start()
+-        logger.info("WebSocket manager started")
++            self._run_id += 1
++            run_id = self._run_id
++            self._is_running = True
++            self._reconnect_exhausted = False
++            self._reconnect_count = 0
++            self._stop_event = threading.Event()
++            stop_event = self._stop_event
++            self._ws_thread = threading.Thread(
++                target=self._run,
++                args=(run_id, stop_event),
++                name="ws-stream",
++                daemon=True,
++            )
++            self._ws_thread.start()
++        logger.info(f"WebSocket manager started (run {run_id})")
+ 
+     def stop(self) -> None:
+-        """Gracefully stop the WebSocket connection and background thread."""
+-        logger.info("Stopping WebSocket manager...")
+-        self._is_running = False
+-
+-        if self._ws:
+-            try:
+-                self._ws.close_connection()
+-            except Exception as e:
+-                logger.warning(f"Error closing WebSocket (non-critical): {e}")
++        """Gracefully stop the WebSocket connection and background thread.
+ 
+-        if self._ws_thread and self._ws_thread.is_alive():
+-            self._ws_thread.join(timeout=5.0)
++        Retires the current run and socket generation first, so whatever
++        the run thread does afterwards (it may still be inside connect())
++        cannot affect a later start(). Then asks the SDK to close and waits
++        a bounded time for the thread.
++        """
++        logger.info("Stopping WebSocket manager...")
++        with self._sub_lock:
++            self._is_running = False
++            self._stop_event.set()                    # interrupt any backoff wait
++            ws, gen, thread = self._ws, self._current_gen, self._ws_thread
++            # Retired generations' monitors may still be exiting (a generation
++            # can be retired a moment before stop(), or by the close below).
++            # Join every one we have not yet seen finish.
++            monitors = list(self._monitors)
++
++        self._close_quietly(ws)
++        if thread and thread.is_alive():
++            thread.join(timeout=self.STOP_JOIN_TIMEOUT)
++            if thread.is_alive() and ws is not None:
++                # connect() may have created its WebSocketApp after our first
++                # close_connection() (which is a no-op before that). Close again.
++                self._close_quietly(ws)
++                thread.join(timeout=self.STOP_JOIN_TIMEOUT)
++            if thread.is_alive():
++                logger.warning(
++                    "WebSocket thread still finishing its connection attempt; "
++                    "its run and socket are retired and it will exit on its own"
++                )
+ 
+-        self._is_connected = False
++        if gen is not None:
++            self._mark_disconnected("stopped", gen)   # also signals the current monitor
++        for monitor in monitors:
++            monitor.stop.set()                        # retired ones were signalled already
++            if monitor.thread is not None and monitor.thread is not threading.current_thread():
++                monitor.thread.join(timeout=self.MONITOR_JOIN_TIMEOUT)
++                if monitor.thread.is_alive():
++                    logger.warning(f"WebSocket health monitor {monitor.gen} still finishing a check")
++        with self._sub_lock:
++            self._monitors = [m for m in self._monitors if m.thread and m.thread.is_alive()]
+         self._audit.log(
+             AuditEventType.SCHEDULER_TASK,
+             {
+@@ -232,64 +408,175 @@ class WebSocketManager:
+             f"dropped: {self._ticks_dropped} | reconnects: {self._reconnect_count}"
+         )
+ 
+-    def _run(self) -> None:
+-        """Main WebSocket loop with auto-reconnect."""
+-        reconnect_delay = self.INITIAL_RECONNECT_DELAY
++    @staticmethod
++    def _close_quietly(ws: Any) -> None:
++        if ws is None:
++            return
++        try:
++            ws.close_connection()                     # ends run_forever -> connect() returns
++        except Exception as e:
++            logger.warning(f"Error closing WebSocket (non-critical): {e}")
++
++    def _run_active(self, run_id: int) -> bool:
++        """True while ``run_id`` is the current run and it has not been stopped."""
++        return self._is_running and self._run_id == run_id
++
++    def _run(self, run_id: int, stop_event: threading.Event) -> None:
++        """Main loop for one run: one bounded, backed-off recovery policy for
++        every way a connection can end.
++
++        ``_connect()`` returns when the socket is gone — a clean server
++        close, a transport error, a refused handshake and a silent failure
++        closed by the monitor all come back the same way (see module
++        docstring) — so *every* return while this run is still current is
++        treated as a failure to recover from.
++
++        The attempt budget resets only after *genuinely healthy* operation:
++        liveness evidence (tick or pong) kept arriving for at least
++        ``STABLE_CONNECTION_SECONDS`` after the socket opened. Uptime alone
++        does not count — a silent connection lives ``HEARTBEAT_TIMEOUT``
++        before the monitor closes it, and repeated silent connections must
++        exhaust the budget rather than refresh it.
++
++        A missing session (``SessionExpiredError``) is not a socket failure
++        and does not spend the socket budget, but it is bounded too:
++        ``MAX_SESSION_EXPIRED_WAIT`` of waiting without credentials ends the
++        run as exhausted. stop() interrupts the wait.
++
++        Once this run is retired (stop(), or a newer start()), the loop
++        exits without touching counters, flags or the socket in use.
++        """
++        delay = self.INITIAL_RECONNECT_DELAY
++        session_wait_started: float | None = None
+ 
+-        while self._is_running:
++        while self._run_active(run_id):
++            session: tuple[float, float] | None = None
+             try:
+-                self._connect()
+-                reconnect_delay = self.INITIAL_RECONNECT_DELAY  # Reset on success
+-                self._reconnect_count = 0
+-
+-            except WebSocketError as e:
+-                if not self._is_running:
+-                    break  # Intentional shutdown
+-
+-                self._reconnect_count += 1
+-                if self._reconnect_count > self.MAX_RECONNECT_ATTEMPTS:
+-                    logger.error(
+-                        f"WebSocket max reconnect attempts ({self.MAX_RECONNECT_ATTEMPTS}) "
+-                        f"exhausted — giving up"
+-                    )
+-                    self._audit.log(
+-                        AuditEventType.ERROR,
+-                        {
+-                            "component": "websocket",
+-                            "error": str(e),
+-                            "reconnect_attempts": self._reconnect_count,
+-                        },
++                session = self._connect(run_id)
++                reason = self._last_disconnect_reason or "connection closed"
++            except SessionExpiredError as e:
++                now = self._clock()
++                if session_wait_started is None:
++                    session_wait_started = now
++                waited = now - session_wait_started
++                with self._sub_lock:
++                    if not self._run_active(run_id):
++                        break
++                    self._waiting_for_session = True
++                    self._session_wait_s = waited
++                if waited >= self.MAX_SESSION_EXPIRED_WAIT:
++                    self._exhaust(
++                        run_id,
++                        f"session expired: credentials unavailable for {waited:.0f}s "
++                        f"(limit {self.MAX_SESSION_EXPIRED_WAIT:.0f}s): {e}",
+                     )
+                     break
+-
+                 logger.warning(
+-                    f"WebSocket disconnected — reconnecting in {reconnect_delay:.0f}s "
+-                    f"(attempt {self._reconnect_count}/{self.MAX_RECONNECT_ATTEMPTS})"
++                    f"WebSocket session expired — waiting for re-auth "
++                    f"({waited:.0f}s/{self.MAX_SESSION_EXPIRED_WAIT:.0f}s): {e}"
+                 )
+-                time.sleep(reconnect_delay)
+-                reconnect_delay = min(reconnect_delay * 2, self.MAX_RECONNECT_DELAY)
++                self._backoff_wait(self.SESSION_EXPIRED_WAIT, stop_event)
++                continue
++            except WebSocketError as e:
++                reason = str(e)
++            except Exception as e:
++                reason = f"unexpected error: {e}"
+ 
+-            except SessionExpiredError:
+-                logger.warning("WebSocket session expired — waiting for re-auth")
+-                time.sleep(5.0)  # Let the session manager handle re-auth
++            session_wait_started = None               # credentials were present this attempt
+ 
+-            except Exception as e:
+-                logger.error(f"Unexpected WebSocket error: {e}")
+-                if self._is_running:
+-                    time.sleep(reconnect_delay)
+-                    reconnect_delay = min(reconnect_delay * 2, self.MAX_RECONNECT_DELAY)
++            with self._sub_lock:
++                if not self._run_active(run_id):
++                    break                             # stopped or superseded: leave state alone
++
++                healthy_for = (session[1] - session[0]) if session is not None else 0.0
++                if healthy_for >= self.STABLE_CONNECTION_SECONDS:
++                    self._reconnect_count = 0
++                    delay = self.INITIAL_RECONNECT_DELAY
++
++                self._reconnect_count += 1
++                exhausted = self._reconnect_count > self.MAX_RECONNECT_ATTEMPTS
++                if exhausted:
++                    self._reconnect_count = self.MAX_RECONNECT_ATTEMPTS
++                attempt = self._reconnect_count
+ 
+-    def _connect(self) -> None:
++            if exhausted:
++                self._exhaust(run_id, reason)
++                break
++
++            logger.warning(
++                f"WebSocket disconnected ({reason}; healthy for {healthy_for:.0f}s) — "
++                f"reconnecting in {delay:.0f}s (attempt {attempt}/{self.MAX_RECONNECT_ATTEMPTS})"
++            )
++            self._backoff_wait(delay, stop_event)
++            delay = min(delay * 2, self.MAX_RECONNECT_DELAY)
++
++    def _exhaust(self, run_id: int, reason: str) -> None:
++        """End run ``run_id`` as exhausted (no-op if it is no longer current)."""
++        with self._sub_lock:
++            if not self._run_active(run_id):
++                return
++            self._reconnect_exhausted = True
++            self._is_running = False
++            self._waiting_for_session = False
++            self._last_disconnect_reason = reason
++            attempts = self._reconnect_count
++        logger.error(f"WebSocket recovery exhausted — giving up | {reason}")
++        self._audit.log(
++            AuditEventType.ERROR,
++            {
++                "component": "websocket",
++                "error": reason,
++                "reconnect_attempts": attempts,
++            },
++        )
++
++    def _backoff_wait(self, delay: float, stop_event: threading.Event | None = None) -> None:
++        """Sleep between attempts; returns early when this run is stopped."""
++        (stop_event or self._stop_event).wait(delay)
++
++    def _create_sdk_client(self, **kwargs: Any) -> Any:
++        """Build a fresh SmartWebSocketV2. Seam for offline tests."""
++        from SmartApi.smartWebSocketV2 import SmartWebSocketV2
++        return SmartWebSocketV2(**kwargs)
++
++    def _attach_socket(self, ws: Any, run_id: int | None = None) -> int | None:
++        """Make ``ws`` the current socket generation and bind its callbacks.
++
++        The SDK hooks are bound to the generation number, not to the socket
++        object: SmartWebSocketV2 passes the underlying WebSocketApp (or, for
++        on_error, two strings) to the hooks, so identity cannot be recovered
++        from the arguments. Returns the generation, or None if ``run_id`` is
++        no longer the current run (stop()/start() raced the attempt).
+         """
+-        Establish WebSocket connection and start streaming.
++        with self._sub_lock:
++            if run_id is not None and not self._run_active(run_id):
++                return None
++            self._socket_gen += 1
++            gen = self._socket_gen
++            ws.on_open = lambda wsapp, client=ws: self._on_open(gen, wsapp, client)
++            ws.on_data = lambda wsapp, message: self._on_data(gen, wsapp, message)
++            ws.on_error = lambda *args: self._on_error(gen, *args)
++            ws.on_close = lambda *args: self._on_close(gen, *args)
++            self._ws = ws
++            self._current_gen = gen
++            return gen
++
++    def _connect(self, run_id: int) -> tuple[float, float] | None:
++        """
++        Establish one WebSocket connection and block until it ends.
++
++        A fresh SDK client is built for every call — never reused — with the
++        SDK's internal retry disabled, so the only party that reconnects or
++        resubscribes is ``_run()`` / ``_on_open()``. Returns (normally) when
++        the socket is gone, with ``(opened, last_evidence)`` epochs for this
++        socket, or None if it never opened.
+ 
+         Raises:
+-            WebSocketError: If connection fails.
++            WebSocketError: If the client cannot be built or the SDK raises
++                out of connect() (it normally does not; see module docstring).
+             SessionExpiredError: If auth tokens are invalid.
+         """
+         try:
+-            from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+-
+             api_key = self._session._vault.get_credential("ANGEL_API_KEY")
+             client_id = self._session.client_id
+             feed_token = self._session.feed_token
+@@ -300,22 +587,35 @@ class WebSocketManager:
+                     "Missing feed/JWT token — session may have expired",
+                     details={"has_feed_token": bool(feed_token), "has_jwt": bool(jwt_token)},
+                 )
++            with self._sub_lock:                      # credentials available: wait is over
++                self._waiting_for_session = False
++                self._session_wait_s = 0.0
+ 
+-            # Create WebSocket instance
+-            self._ws = SmartWebSocketV2(
++            ws = self._create_sdk_client(
+                 auth_token=jwt_token,
+                 api_key=api_key,
+                 client_code=client_id,
+                 feed_token=feed_token,
++                max_retry_attempt=0,      # SDK retry OFF: _run() owns recovery
+             )
+ 
+-            # Register callbacks
+-            self._ws.on_open = self._on_open
+-            self._ws.on_data = self._on_data
+-            self._ws.on_error = self._on_error
+-            self._ws.on_close = self._on_close
++            gen = self._attach_socket(ws, run_id)
++            if gen is None:
++                return None               # run retired before we could connect
++            if not self._run_active(run_id):
++                # stop() landed between attach and here. Its close_connection()
++                # was a no-op (no WebSocketApp yet), so do not open at all.
++                self._mark_disconnected("retired before connect", gen)
++                return None
++            try:
++                ws.connect()              # blocks in run_forever until the socket ends
++            finally:
++                self._mark_disconnected("connection closed", gen)   # no-op if retired already
+ 
+-            self._ws.connect()
++            with self._sub_lock:
++                if self._opened_gen != gen:
++                    return None
++                return (self._opened_epoch, self._evidence_epoch(ws))
+ 
+         except ImportError:
+             raise WebSocketError(
+@@ -331,109 +631,290 @@ class WebSocketManager:
+                 details={"error": type(e).__name__, "message": str(e)},
+             )
+ 
+-    # ── WebSocket Callbacks ──────────────────────────────
++    def _mark_disconnected(self, reason: str, gen: int) -> bool:
++        """Retire socket generation ``gen`` if it is the current one.
+ 
+-    def _on_open(self, ws: Any) -> None:
+-        """Called when WebSocket connection is established."""
+-        self._is_connected = True
+-        self._connected_at = datetime.now(IST)
++        Returns False (and changes nothing) when ``gen`` has already been
++        retired — a delayed callback or a late-finishing run must not
++        disconnect the replacement or wipe its sent state.
++        """
++        with self._delivery_lock, self._sub_lock:     # wait out an in-flight delivery
++            if gen != self._current_gen:
++                return False
++            was_connected = self._is_connected
++            self._is_connected = False
++            self._sent_tokens.clear()                 # nothing is live on a dead socket
++            self._last_disconnect_reason = reason
++            self._ws = None
++            self._current_gen = None
++            if self._monitor is not None and self._monitor.gen == gen:
++                self._monitor.stop.set()              # retired: its monitor exits
++                self._monitor = None
++        if was_connected:
++            logger.info(f"WebSocket disconnected | reason={reason}")
++        return True
+ 
+-        logger.info("WebSocket connected")
++    # ── WebSocket Callbacks ──────────────────────────────
+ 
+-        # Subscribe to any pending tokens
+-        with self._sub_lock:
+-            if self._pending_subscribes:
+-                self._do_subscribe(list(self._pending_subscribes))
+-                self._pending_subscribes.clear()
++    def _on_open(self, gen: int, ws: Any, client: Any = None) -> None:
++        """SDK ``on_open(wsapp)`` for socket generation ``gen``.
+ 
+-            # Re-subscribe to previously active tokens (on reconnect)
+-            if self._subscribed_tokens:
+-                self._do_subscribe(list(self._subscribed_tokens))
++        This is the only place subscriptions are (re)established after a
++        connection opens: exactly the current requested set, nothing from
++        any previous socket and nothing from the SDK's own replay.
+ 
+-    def _on_data(self, ws: Any, message: Any) -> None:
+-        """Called when tick data is received."""
++        A retired generation opening late (stop() closed it before the SDK
++        had built its WebSocketApp, so that close was a no-op) is not just
++        ignored: it is closed here, otherwise it would stay connected beside
++        the replacement and hold a broker slot. ``client`` is the
++        SmartWebSocketV2 the hook was bound to — the SDK only passes the
++        underlying WebSocketApp.
++        """
++        stale_client = None
++        with self._sub_lock:
++            if gen != self._current_gen:
++                self._stale_callbacks_ignored += 1
++                logger.warning(f"Retired socket generation {gen} opened late — closing it")
++                stale_client = client
++            else:
++                # Flip to connected *inside* the lock so a concurrent subscribe()
++                # either sees "offline" (and only records the request) or sees
++                # the fully reset per-connection state — never a half-open socket.
++                self._is_connected = True
++                self._connected_at = datetime.now(IST)
++                self._opened_epoch = self._clock()
++                self._opened_gen = gen
++                self._connections_opened += 1
++                self._sent_tokens.clear()   # fresh socket: nothing sent on it yet
++                logger.info(f"WebSocket connected (socket generation {gen})")
++                self._sync_locked()
++                self._start_monitor(gen, client)
++        if stale_client is not None:
++            self._close_quietly(stale_client)         # outside the lock; ends its run_forever
++
++    def _on_data(self, gen: int, ws: Any, message: Any) -> None:
++        """SDK ``on_data(wsapp, message)`` for socket generation ``gen``.
++
++        Parsing touches no shared state and runs unlocked. Publication —
++        buffering the tick and delivering it to callbacks — happens under
++        ``_delivery_lock`` with the generation re-checked, so a tick whose
++        socket was retired while it was being parsed is dropped, and a
++        retirement cannot complete in the middle of a delivery.
++        """
+         try:
++            with self._sub_lock:
++                if gen != self._current_gen:          # cheap early exit
++                    self._stale_ticks_dropped += 1
++                    return
++
+             tick = self._parse_tick(message)
+             if tick is None:
+                 return
+ 
+-            self._ticks_received += 1
+-            self._last_tick_at = datetime.now(IST)
++            with self._delivery_lock:
++                with self._sub_lock:
++                    if gen != self._current_gen:      # retired while parsing
++                        self._stale_ticks_dropped += 1
++                        return
+ 
+-            # Add to buffer
+-            if len(self._tick_buffer) >= self.TICK_BUFFER_SIZE:
+-                self._ticks_dropped += 1
+-            self._tick_buffer.append(tick)
++                self._ticks_received += 1
++                self._last_tick_at = datetime.now(IST)
++                self._last_tick_epoch = self._clock()
+ 
+-            # Invoke callbacks
+-            for callback in self._tick_callbacks:
+-                try:
+-                    callback(tick)
+-                except Exception as e:
+-                    logger.error(f"Tick callback error: {e}")
++                # Add to buffer
++                if len(self._tick_buffer) >= self.TICK_BUFFER_SIZE:
++                    self._ticks_dropped += 1
++                self._tick_buffer.append(tick)
++
++                # Invoke callbacks
++                for callback in self._tick_callbacks:
++                    try:
++                        callback(tick)
++                    except Exception as e:
++                        logger.error(f"Tick callback error: {e}")
+ 
+         except Exception as e:
+             logger.debug(f"Tick parse error (non-critical): {e}")
+ 
+-    def _on_error(self, ws: Any, error: Any) -> None:
+-        """Called on WebSocket error."""
+-        error_msg = str(error) if error else "Unknown error"
+-        logger.error(f"WebSocket error: {error_msg}")
+-        self._is_connected = False
++    def _on_error(self, gen: int, *args: Any) -> None:
++        """SDK ``on_error`` for socket generation ``gen``.
+ 
+-    def _on_close(self, ws: Any, close_status_code: Any, close_msg: Any) -> None:
+-        """Called when WebSocket connection is closed."""
+-        self._is_connected = False
+-        logger.info(f"WebSocket closed | code={close_status_code} | msg={close_msg}")
++        Called as ``on_error(wsapp, error)`` — or, with its retry disabled,
++        as ``on_error("Max retry attempt reached", "Connection closed")``
++        after the SDK has already closed the socket. This is also how every
++        *close* reaches us, because the SDK's own ``_on_close`` wrapper
++        cannot accept websocket-client's arguments.
++        """
++        source, error = (tuple(args) + (None, None))[:2]
++        reason = f"{source}: {error}" if isinstance(source, str) else (str(error) or "Unknown error")
++        if not self._mark_disconnected(reason, gen):
++            with self._sub_lock:
++                self._stale_callbacks_ignored += 1
++            logger.debug(f"Ignoring on_error from retired socket generation {gen}: {reason}")
++            return
++        logger.error(f"WebSocket error: {reason}")
++
++    def _on_close(self, gen: int, *args: Any) -> None:
++        """SDK ``on_close`` for socket generation ``gen``.
++
++        Wired for completeness: SmartWebSocketV2 would forward this as
++        ``on_close(wsapp)`` if its wrapper worked, and websocket-client
++        passes ``(wsapp, code, msg)``; both forms are accepted. In practice
++        closes arrive via ``_on_error`` and connect() returning, and the
++        manager does not depend on this hook firing.
++        """
++        _, code, msg = (tuple(args) + (None, None, None))[:3]
++        reason = f"closed | code={code} | msg={msg}"
++        if not self._mark_disconnected(reason, gen):
++            with self._sub_lock:
++                self._stale_callbacks_ignored += 1
++            logger.debug(f"Ignoring on_close from retired socket generation {gen}")
++            return
++        logger.info(f"WebSocket {reason}")
++
++    # ── Health Monitoring ────────────────────────────────
++
++    def _start_monitor(self, gen: int, client: Any) -> None:
++        """Start the health monitor for socket generation ``gen``.
++        Caller holds ``_sub_lock`` and ``gen`` is current."""
++        if client is None:
++            return                                    # nothing to inspect or close
++        if self._monitor is not None:                 # defensive: only one at a time
++            self._monitor.stop.set()
++        monitor = _Monitor(gen, client)
++        monitor.thread = threading.Thread(
++            target=self._monitor_loop,
++            args=(monitor,),
++            name=f"ws-health-{gen}",
++            daemon=True,
++        )
++        self._monitor = monitor
++        self._monitors = [m for m in self._monitors if m.thread and m.thread.is_alive()]
++        self._monitors.append(monitor)
++        monitor.thread.start()
++
++    def _monitor_wait(self, stop_event: threading.Event, interval: float) -> bool:
++        """Wait for the next check. True means the monitor was stopped."""
++        return stop_event.wait(interval)
++
++    def _monitor_loop(self, monitor: _Monitor) -> None:
++        while not self._monitor_wait(monitor.stop, self.HEALTH_CHECK_INTERVAL):
++            if not self._health_check(monitor.gen, monitor.client):
++                break
++
++    def _evidence_epoch(self, client: Any) -> float:
++        """Most recent proof that the current socket is alive."""
++        wsapp = getattr(client, "wsapp", None)
++        pong = float(getattr(wsapp, "last_pong_tm", 0.0) or 0.0)
++        sdk_pong = float(getattr(client, "last_pong_timestamp", None) or 0.0)
++        return max(self._opened_epoch, self._last_tick_epoch, pong, sdk_pong)
++
++    def _health_check(self, gen: int, client: Any) -> bool:
++        """One health check for socket generation ``gen``.
++
++        Returns False when the monitor should exit: the generation is no
++        longer current, or it was just declared dead. A retired generation's
++        check is a no-op — it can neither close nor reconnect anything.
++
++        While healthy, re-runs the subscription sync so a change that failed
++        earlier (rejected send, held-back replacement) is retried without
++        waiting for the next subscribe()/unsubscribe(); the capacity guard
++        inside ``_sync_locked`` applies unchanged.
++        """
++        with self._sub_lock:
++            if gen != self._current_gen or not self._is_connected:
++                return False
++            now = self._clock()
++            quiet_for = now - self._evidence_epoch(client)
++            if quiet_for > self.HEARTBEAT_TIMEOUT:
++                reason = (
++                    f"heartbeat timeout: no pong or tick for {quiet_for:.0f}s "
++                    f"(limit {self.HEARTBEAT_TIMEOUT:.0f}s)"
++                )
++                self._silent_failures += 1
++            else:
++                reason = None
++                if self._requested_tokens != self._sent_tokens:
++                    self._subscription_retries += 1
++                    logger.info(
++                        f"Retrying {len(self._requested_tokens ^ self._sent_tokens)} "
++                        f"pending subscription change(s)"
++                    )
++                    self._sync_locked()
++
++        if reason is None:
++            return True
++
++        logger.error(f"WebSocket silent failure on generation {gen}: {reason}")
++        if self._mark_disconnected(reason, gen):      # retire first: nothing else may act on it
++            self._close_quietly(client)               # run_forever ends -> _run() recovers
++        return False
+ 
+     # ── Internal Operations ──────────────────────────────
+ 
+-    def _do_subscribe(self, tokens: list[str]) -> None:
+-        """Send subscribe request to WebSocket."""
+-        if not tokens or not self._ws:
++    def _sync_locked(self) -> None:
++        """Bring the open socket in line with ``_requested_tokens``.
++
++        Caller must hold ``_sub_lock``. No-op while disconnected. Sends the
++        unsubscribe diff first (frees SmartAPI slots), then the subscribe
++        diff. A batch that the SDK rejects leaves ``_sent_tokens`` untouched,
++        so the same diff is retried on the next call.
++
++        Additions are only sent into slots that are actually free on the
++        wire. If an unsubscribe failed, its token still occupies a slot, so
++        the corresponding replacement is held back (it stays in
++        ``pending_changes``) until a later sync frees the slot. The wire
++        therefore never holds more than the per-connection limit, even
++        though the *requested* set may already reflect the swap.
++        """
++        if not self._is_connected or not self._ws:
+             return
+ 
++        to_remove = self._sent_tokens - self._requested_tokens
++        if to_remove and self._send_unsubscribe(sorted(to_remove)):
++            self._sent_tokens -= to_remove
++
++        to_add = sorted(self._requested_tokens - self._sent_tokens)
++        free_slots = SMARTAPI_MAX_TOKENS_PER_CONNECTION - len(self._sent_tokens)
++        if len(to_add) > free_slots:
++            still_live = len(self._sent_tokens - self._requested_tokens)
++            logger.warning(
++                f"Holding back {len(to_add) - max(free_slots, 0)} subscription(s): "
++                f"connection full, {still_live} unsubscribe(s) not yet confirmed sent"
++            )
++            to_add = to_add[:max(free_slots, 0)]
++
++        if to_add and self._send_subscribe(to_add):
++            self._sent_tokens |= set(to_add)
++
++    def _send_subscribe(self, tokens: list[str]) -> bool:
++        """Hand a subscribe request to the SDK. True if it was sent without
++        error — this says nothing about whether the broker accepted it."""
+         try:
+-            # SmartAPI subscription format
+-            token_list = [
+-                {
+-                    "exchangeType": 1,  # NSE
+-                    "tokens": tokens,
+-                }
+-            ]
+             self._ws.subscribe(
+                 correlation_id="trend_investorr",
+                 mode=self._feed_mode.value,
+-                token_list=token_list,
++                token_list=[{"exchangeType": 1, "tokens": tokens}],  # NSE
+             )
+-            self._subscribed_tokens.update(tokens)
+-            logger.debug(f"Subscribed to {len(tokens)} tokens via WebSocket")
+-
++            logger.debug(f"Subscribe request sent for {len(tokens)} tokens")
++            return True
+         except Exception as e:
+-            logger.error(f"WebSocket subscribe failed: {e}")
+-
+-    def _do_unsubscribe(self, tokens: list[str]) -> None:
+-        """Send unsubscribe request to WebSocket."""
+-        if not tokens or not self._ws:
+-            return
++            logger.error(f"WebSocket subscribe failed for {len(tokens)} tokens: {e}")
++            return False
+ 
++    def _send_unsubscribe(self, tokens: list[str]) -> bool:
++        """Hand an unsubscribe request to the SDK. True if sent without error."""
+         try:
+-            token_list = [
+-                {
+-                    "exchangeType": 1,
+-                    "tokens": tokens,
+-                }
+-            ]
+             self._ws.unsubscribe(
+                 correlation_id="trend_investorr",
+                 mode=self._feed_mode.value,
+-                token_list=token_list,
++                token_list=[{"exchangeType": 1, "tokens": tokens}],
+             )
+-            self._subscribed_tokens -= set(tokens)
+-            logger.debug(f"Unsubscribed from {len(tokens)} tokens")
+-
++            logger.debug(f"Unsubscribe request sent for {len(tokens)} tokens")
++            return True
+         except Exception as e:
+-            logger.error(f"WebSocket unsubscribe failed: {e}")
++            logger.error(f"WebSocket unsubscribe failed for {len(tokens)} tokens: {e}")
++            return False
+ 
+     def _parse_tick(self, message: Any) -> Tick | None:
+         """
+@@ -517,8 +998,51 @@ class WebSocketManager:
+         return self._is_running
+ 
+     @property
+-    def subscribed_count(self) -> int:
+-        return len(self._subscribed_tokens)
++    def reconnect_exhausted(self) -> bool:
++        """True once the recovery budget was spent; start() clears it."""
++        return self._reconnect_exhausted
++
++    @property
++    def state(self) -> str:
++        """One of: stopped | connecting | connected | reconnecting | exhausted."""
++        if self._is_connected:
++            return "connected"
++        if self._reconnect_exhausted:
++            return "exhausted"
++        if self._is_running:
++            if self._waiting_for_session:
++                return "waiting_for_session"
++            return "reconnecting" if self._reconnect_count else "connecting"
++        return "stopped"
++
++    @property
++    def requested_count(self) -> int:
++        """Tokens the caller currently wants streamed."""
++        with self._sub_lock:
++            return len(self._requested_tokens)
++
++    @property
++    def sent_count(self) -> int:
++        """Tokens whose subscribe request was sent on the current connection
++        (not a broker acknowledgment — the SDK exposes none)."""
++        with self._sub_lock:
++            return len(self._sent_tokens)
++
++    @property
++    def is_synced(self) -> bool:
++        """True when a socket is open *and* it matches the requested set —
++        every requested token was sent on it and nothing else is live.
++        ``is_connected`` alone flips before the requested set is sent."""
++        with self._sub_lock:
++            return self._is_connected and self._requested_tokens == self._sent_tokens
++
++    @property
++    def pending_changes(self) -> set[str]:
++        """Tokens whose socket state does not yet match the request: either
++        requested but not sent (offline, or send failed) or sent but no
++        longer requested (unsubscribe failed)."""
++        with self._sub_lock:
++            return self._requested_tokens ^ self._sent_tokens
+ 
+     @property
+     def buffer_size(self) -> int:
+@@ -527,10 +1051,37 @@ class WebSocketManager:
+     @property
+     def stats(self) -> dict[str, Any]:
+         """Connection statistics for monitoring."""
++        with self._sub_lock:
++            requested = len(self._requested_tokens)
++            sent = len(self._sent_tokens)
++            pending = len(self._requested_tokens ^ self._sent_tokens)
++            stale_callbacks = self._stale_callbacks_ignored
++            synced = self._is_connected and self._requested_tokens == self._sent_tokens
++            monitor = self._monitor
++            evidence_age = (
++                round(self._clock() - self._evidence_epoch(monitor.client), 1)
++                if monitor is not None and self._is_connected else None
++            )
+         return {
++            "state": self.state,
++            "is_synced": synced,
++            "monitor_alive": bool(monitor and monitor.thread and monitor.thread.is_alive()),
++            "evidence_age_s": evidence_age,
++            "silent_failures": self._silent_failures,
++            "subscription_retries": self._subscription_retries,
++            "run_id": self._run_id,
++            "socket_generation": self._socket_gen,
++            "stale_callbacks_ignored": stale_callbacks,
++            "stale_ticks_dropped": self._stale_ticks_dropped,
+             "is_connected": self._is_connected,
+             "is_running": self._is_running,
+-            "subscribed_tokens": len(self._subscribed_tokens),
++            "reconnect_exhausted": self._reconnect_exhausted,
++            "connections_opened": self._connections_opened,
++            "last_disconnect_reason": self._last_disconnect_reason,
++            "session_wait_s": round(self._session_wait_s),
++            "requested_tokens": requested,
++            "sent_tokens": sent,
++            "pending_changes": pending,
+             "ticks_received": self._ticks_received,
+             "ticks_dropped": self._ticks_dropped,
+             "buffer_size": len(self._tick_buffer),
+@@ -542,6 +1093,6 @@ class WebSocketManager:
+     def __repr__(self) -> str:
+         return (
+             f"WebSocketManager(connected={self._is_connected}, "
+-            f"tokens={len(self._subscribed_tokens)}, "
++            f"requested={len(self._requested_tokens)}, sent={len(self._sent_tokens)}, "
+             f"ticks={self._ticks_received})"
+         )
+diff --git a/AlgoAnalystBackend/requirements.txt b/AlgoAnalystBackend/requirements.txt
+index 410aaae..0282f64 100644
+--- a/AlgoAnalystBackend/requirements.txt
++++ b/AlgoAnalystBackend/requirements.txt
+@@ -4,7 +4,10 @@ requests>=2.31.0
+ pandas>=2.1.0
+ 
+ # Angel One SmartAPI
+-smartapi-python>=1.3.0
++# data/streams/websocket_manager.py disables the SDK's internal reconnect
++# (max_retry_attempt=0) and owns resubscribe itself; that policy is verified
++# against 1.5.5 (+ websocket-client 1.9.2). Re-verify before widening.
++smartapi-python>=1.5.5
+ logzero>=1.7.0
+ pyotp>=2.9.0
+ 
+diff --git a/AlgoAnalystBackend/tests/data/conftest.py b/AlgoAnalystBackend/tests/data/conftest.py
+new file mode 100644
+index 0000000..03641fd
+--- /dev/null
++++ b/AlgoAnalystBackend/tests/data/conftest.py
+@@ -0,0 +1,25 @@
++"""
++Shared guards for tests/data.
++
++Every WebSocketManager that opens a socket starts a health monitor thread
++bound to that socket generation; a test that opens sockets must stop the
++manager. This guard makes a leaked run or monitor thread fail the test
++that leaked it, instead of surfacing as a miscount in a later test.
++"""
++
++import threading
++
++import pytest
++
++
++def websocket_threads() -> list[str]:
++    return sorted(t.name for t in threading.enumerate() if t.name.startswith("ws-"))
++
++
++@pytest.fixture(autouse=True)
++def _no_leaked_websocket_threads():
++    before = websocket_threads()
++    assert before == [], f"websocket threads leaked by an earlier test: {before}"
++    yield
++    after = websocket_threads()
++    assert after == [], f"websocket threads left alive: {after}"
+diff --git a/AlgoAnalystBackend/tests/data/test_websocket_generations.py b/AlgoAnalystBackend/tests/data/test_websocket_generations.py
+new file mode 100644
+index 0000000..0904747
+--- /dev/null
++++ b/AlgoAnalystBackend/tests/data/test_websocket_generations.py
+@@ -0,0 +1,383 @@
++"""
++Offline regression tests: callbacks and stop/start across connection
++generations.
++
++Every SDK client the manager builds is one *socket generation*; every
++start() is one *run*. Only the current generation may change connection
++state or deliver ticks, and only the current run may drive recovery.
++Callbacks from a retired socket can arrive late (the SDK's close and error
++hooks fire from the socket thread during teardown), and a retired run's
++thread can still be finishing its connect() when a new run begins.
++
++Uses the SDK-faithful fake from tests/data/ws_fakes.py and the manager's
++real start()/_run()/_connect() path.
++"""
++
++from __future__ import annotations
++
++import sys
++import threading
++import types
++
++import pytest
++
++from data.streams.websocket_manager import WebSocketManager
++from tests.data.ws_fakes import FakeAudit, FakeSession, FakeSmartWebSocketV2, wait_until
++
++
++TOKEN = "2885"
++TOKEN_B = "11536"
++
++
++def smartapi_message(token: str = TOKEN, ltp_paisa: int = 10_000) -> dict:
++    return {"token": token, "name": "RELIANCE", "last_traded_price": ltp_paisa,
++            "volume_trade_for_the_day": 1_000}
++
++
++# ── Fixtures ─────────────────────────────────────────────────
++
++
++@pytest.fixture
++def sdk(monkeypatch):
++    FakeSmartWebSocketV2.reset([])
++    module = types.ModuleType("SmartApi.smartWebSocketV2")
++    module.SmartWebSocketV2 = FakeSmartWebSocketV2
++    package = types.ModuleType("SmartApi")
++    package.smartWebSocketV2 = module
++    monkeypatch.setitem(sys.modules, "SmartApi", package)
++    monkeypatch.setitem(sys.modules, "SmartApi.smartWebSocketV2", module)
++    return FakeSmartWebSocketV2
++
++
++@pytest.fixture
++def ws_manager(sdk, monkeypatch):
++    monkeypatch.setattr(WebSocketManager, "STOP_JOIN_TIMEOUT", 0.2, raising=False)
++    mgr = WebSocketManager(session=FakeSession(), audit=FakeAudit())
++    yield mgr
++    for client in sdk.instances:          # never leave a session blocked
++        client.release_close()
++    mgr.stop()
++    if mgr._ws_thread is not None:
++        mgr._ws_thread.join(timeout=5)
++
++
++@pytest.fixture
++def backoff(ws_manager, monkeypatch):
++    delays: list[float] = []
++    gate = threading.Event()
++    gate.set()
++
++    def fake_wait(delay, stop_event=None):
++        delays.append(delay)
++        gate.wait(timeout=5)
++
++    monkeypatch.setattr(ws_manager, "_backoff_wait", fake_wait, raising=False)
++    return types.SimpleNamespace(delays=delays, gate=gate)
++
++
++def connect_then_replace(ws_manager, sdk, backoff):
++    """Connection 1 comes up, the server drops it, connection 2 comes up.
++    Returns (first, second) SDK clients; first is retired, second current."""
++    sdk.reset(["stay_open", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 1 and ws_manager.is_synced)
++    first = sdk.instances[0]
++    first.drop("server_close")
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    second = sdk.instances[1]
++    assert first.frames == [("subscribe", [TOKEN])]
++    assert second.frames == [("subscribe", [TOKEN])]
++    assert ws_manager.sent_count == 1
++    return first, second
++
++
++# ── Delayed callbacks from a retired socket ──────────────────
++
++
++def test_delayed_close_and_error_from_old_socket_do_not_touch_replacement(
++    ws_manager, sdk, backoff
++):
++    first, second = connect_then_replace(ws_manager, sdk, backoff)
++
++    first.on_close(first.wsapp)                                   # SDK declared form
++    first.on_close(first.wsapp, 1006, "abnormal")                 # websocket-client form
++    first.on_error("Max retry attempt reached", "Connection closed")
++    first.on_error(first.wsapp, ConnectionResetError("late"))
++
++    assert ws_manager.is_connected
++    assert ws_manager.sent_count == 1                             # sent state intact
++    assert ws_manager.pending_changes == set()
++    assert ws_manager.stats["state"] == "connected"
++    assert ws_manager.stats["stale_callbacks_ignored"] == 4
++    assert len(sdk.instances) == 2                                # no reconnect triggered
++
++
++def test_delayed_open_from_old_socket_cannot_mark_connected_or_resend(
++    ws_manager, sdk, backoff
++):
++    first, second = connect_then_replace(ws_manager, sdk, backoff)
++
++    first.on_open(first.wsapp)
++
++    assert first.frames == [("subscribe", [TOKEN])]               # nothing new on old
++    assert second.frames == [("subscribe", [TOKEN])]              # nothing doubled on new
++    assert ws_manager.stats["connections_opened"] == 2
++    assert ws_manager.sent_count == 1
++    assert ws_manager.stats["stale_callbacks_ignored"] == 1
++
++
++def test_stale_ticks_from_old_socket_are_dropped_and_current_ones_delivered(
++    ws_manager, sdk, backoff
++):
++    first, second = connect_then_replace(ws_manager, sdk, backoff)
++    delivered = []
++    ws_manager.on_tick(delivered.append)
++
++    first.on_data(first.wsapp, smartapi_message(ltp_paisa=9_000))     # stale
++    assert delivered == []
++    assert ws_manager.stats["ticks_received"] == 0
++    assert ws_manager.stats["stale_ticks_dropped"] == 1
++    assert ws_manager.get_latest_tick(TOKEN) is None
++
++    second.on_data(second.wsapp, smartapi_message(ltp_paisa=10_100))  # current
++    assert [t.ltp for t in delivered] == [101.0]
++    assert ws_manager.stats["ticks_received"] == 1
++    assert ws_manager.get_latest_tick(TOKEN).ltp == 101.0
++
++
++# ── stop() / start() while the old attempt is still finishing ─
++
++
++def test_stop_then_start_while_old_connect_is_still_finishing(ws_manager, sdk, backoff):
++    """stop() asks connection 1 to close but its run_forever has not
++    returned yet. start() must create run 2 / connection 2 immediately.
++    When connection 1 finally ends, the old run's cleanup must neither
++    disconnect connection 2, wipe its sent state, nor resume looping."""
++    sdk.reset(["stay_open", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.is_synced)
++    first = sdk.instances[0]
++    first.close_blocks = True
++    old_thread = ws_manager._ws_thread
++
++    ws_manager.stop()                                             # join times out
++    assert first.close_requested.is_set()
++    assert old_thread.is_alive()                                  # attempt still finishing
++    assert ws_manager.stats["state"] == "stopped"
++    assert not ws_manager.is_connected
++
++    ws_manager.subscribe([TOKEN_B])                               # change while stopped
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    second = sdk.instances[1]
++    assert second.frames == [("subscribe", [TOKEN_B, TOKEN])]
++    assert ws_manager.sent_count == 2
++    assert ws_manager.stats["run_id"] == 2
++    new_thread = ws_manager._ws_thread
++    assert new_thread is not old_thread
++
++    first.release_close()                                         # old attempt now ends
++    assert wait_until(lambda: not old_thread.is_alive())
++
++    assert ws_manager.is_connected                                # replacement untouched
++    assert ws_manager.sent_count == 2
++    assert ws_manager.pending_changes == set()
++    assert ws_manager.stats["state"] == "connected"
++    assert ws_manager.stats["reconnect_count"] == 0
++    assert len(sdk.instances) == 2                                # old loop did not revive
++    assert backoff.delays == []
++    assert new_thread.is_alive()
++    assert ws_manager._ws is second
++
++
++def test_old_run_cannot_exhaust_or_stop_the_new_run(ws_manager, sdk, backoff):
++    """Variant: the old attempt ends with an error after the restart. The
++    old run must not count it against the new run's budget."""
++    sdk.reset(["stay_open", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.is_synced)
++    first = sdk.instances[0]
++    first.close_blocks = True
++    ws_manager.stop()
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    old_thread = [t for t in threading.enumerate() if t.name == "ws-stream" and t is not ws_manager._ws_thread]
++
++    first.drop("transport_error")                                 # old session errors out
++    first.release_close()
++    assert wait_until(lambda: all(not t.is_alive() for t in old_thread))
++
++    assert ws_manager.is_connected
++    assert ws_manager.stats["reconnect_count"] == 0
++    assert ws_manager.stats["reconnect_exhausted"] is False
++    assert ws_manager.is_running
++    assert backoff.delays == []
++
++
++# ── Concurrent / repeated start() ────────────────────────────
++
++
++def test_concurrent_start_calls_spawn_exactly_one_run(ws_manager, sdk, backoff):
++    sdk.reset(["stay_open"] * 8)
++    ws_manager.subscribe([TOKEN])
++    n = 8
++    barrier = threading.Barrier(n)
++
++    def call_start():
++        barrier.wait()
++        ws_manager.start()
++
++    threads = [threading.Thread(target=call_start) for _ in range(n)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join(timeout=5)
++    assert wait_until(lambda: ws_manager.is_synced)
++
++    assert [t.name for t in threading.enumerate()].count("ws-stream") == 1
++    assert len(sdk.instances) == 1
++    assert ws_manager.stats["run_id"] == 1
++    assert sdk.instances[0].frames == [("subscribe", [TOKEN])]
++
++
++def test_start_while_running_is_a_no_op_and_restart_after_stop_gets_new_run(
++    ws_manager, sdk, backoff
++):
++    sdk.reset(["stay_open", "stay_open"])
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.is_synced)
++    ws_manager.start()                                            # already running
++    assert ws_manager.stats["run_id"] == 1
++    assert len(sdk.instances) == 1
++
++    ws_manager.stop()
++    assert wait_until(lambda: not ws_manager._ws_thread.is_alive())
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    assert ws_manager.stats["run_id"] == 2
++    assert ws_manager.stats["socket_generation"] == 2
++
++
++# ── Retired client that opens late must be closed ────────────
++
++
++def test_retired_client_that_opens_late_is_closed_without_touching_replacement(
++    ws_manager, sdk, backoff
++):
++    """Run 1 attaches client 1 but is descheduled before the SDK builds its
++    WebSocketApp. stop() runs now: close_connection() is a no-op (nothing
++    to close yet), the join times out, generation 1 is retired. start()
++    brings up client 2. Then client 1 finally opens. Ignoring its on_open
++    is not enough — it would stay connected beside client 2, holding a
++    broker slot. It must be closed, and client 2 must not notice."""
++    gate1 = threading.Event()
++    sdk.reset(["stay_open", "stay_open"])
++    sdk.connect_gates.append(gate1)
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 1 and sdk.instances[0].connect_calls == 1)
++    first = sdk.instances[0]
++    old_thread = ws_manager._ws_thread
++    assert first.wsapp is None                                    # held before WebSocketApp
++
++    ws_manager.stop()
++    assert first.close_calls >= 1 and first.wsapp is None         # closes were no-ops
++    assert old_thread.is_alive()
++
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    second = sdk.instances[1]
++    assert second.frames == [("subscribe", [TOKEN])]
++
++    gate1.set()                                                   # client 1 opens now
++    assert wait_until(lambda: not old_thread.is_alive())
++
++    assert first.closed_while_open                                # it was live, and got closed
++    assert not first._open
++    assert first.frames == []                                     # never subscribed
++    assert ws_manager.stats["stale_callbacks_ignored"] >= 1
++    # replacement untouched
++    assert ws_manager.is_connected and ws_manager.is_synced
++    assert ws_manager._ws is second and second._open
++    assert second.frames == [("subscribe", [TOKEN])]
++    assert ws_manager.sent_count == 1
++    assert ws_manager.stats["reconnect_count"] == 0
++    assert len(sdk.instances) == 2
++
++
++# ── Tick in flight across retirement ─────────────────────────
++
++
++def test_tick_paused_after_generation_check_is_not_published_after_replacement(
++    ws_manager, sdk, backoff
++):
++    """on_data from socket 1 passes the generation check, then the socket
++    thread is descheduled inside parsing. Meanwhile socket 1 is dropped and
++    socket 2 is current. When parsing resumes, the tick must not reach the
++    buffer or the callbacks: publication itself is guarded, not just entry."""
++    sdk.reset(["stay_open", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 1 and ws_manager.is_synced)
++    first = sdk.instances[0]
++    delivered = []
++    ws_manager.on_tick(delivered.append)
++
++    paused, resume = threading.Event(), threading.Event()
++    real_parse = ws_manager._parse_tick
++
++    def slow_parse(message):
++        tick = real_parse(message)
++        if not paused.is_set():                                   # first tick only
++            paused.set()
++            assert resume.wait(timeout=5)
++        return tick
++
++    ws_manager._parse_tick = slow_parse
++    socket_thread = threading.Thread(
++        target=first.on_data, args=(first.wsapp, smartapi_message(ltp_paisa=9_000))
++    )
++    socket_thread.start()
++    assert paused.wait(timeout=5)                                 # passed the entry check
++
++    first.drop("server_close")                                    # retire socket 1 ...
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    second = sdk.instances[1]
++
++    resume.set()                                                  # ... then parsing resumes
++    socket_thread.join(timeout=5)
++    assert not socket_thread.is_alive()
++
++    assert delivered == []
++    assert ws_manager.stats["ticks_received"] == 0
++    assert ws_manager.stats["stale_ticks_dropped"] == 1
++    assert ws_manager.get_latest_tick(TOKEN) is None
++
++    second.on_data(second.wsapp, smartapi_message(ltp_paisa=10_100))
++    assert [t.ltp for t in delivered] == [101.0]
++
++
++# ── Waiting for subscriptions to be sent is explicit ─────────
++
++
++def test_is_synced_is_true_only_once_subscriptions_are_sent(ws_manager, sdk, backoff):
++    """is_connected flips when the socket opens, *before* the requested set
++    is sent. Tests (and readiness checks) that inspect what was sent must
++    wait on is_synced, which is True only when the socket matches the
++    requested set."""
++    sdk.reset(["stay_open"])
++    sdk.subscribe_delay = 0.1                                     # sending takes a while
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.is_connected)
++    client = sdk.instances[0]
++    frames_at_connected = list(client.frames)
++
++    assert wait_until(lambda: ws_manager.is_synced)
++    assert client.frames == [("subscribe", [TOKEN_B, TOKEN])]
++    assert frames_at_connected == []                              # connected != sent
++    assert ws_manager.stats["is_synced"] is True
+diff --git a/AlgoAnalystBackend/tests/data/test_websocket_health.py b/AlgoAnalystBackend/tests/data/test_websocket_health.py
+new file mode 100644
+index 0000000..9502027
+--- /dev/null
++++ b/AlgoAnalystBackend/tests/data/test_websocket_health.py
+@@ -0,0 +1,397 @@
++"""
++Offline regression tests: connection health monitoring and periodic retry
++of pending subscription changes.
++
++Heartbeat evidence available from the installed stack (smartapi-python
++1.5.5 / websocket-client 1.9.2):
++
++  * websocket-client sends a ping frame every HEART_BEAT_INTERVAL (10 s)
++    but the SDK passes no ``ping_timeout``, so a dead connection never
++    produces a close callback — the socket thread just blocks in recv.
++  * websocket-client records ``wsapp.last_pong_tm`` on every pong frame.
++    The SDK's own ``last_pong_timestamp`` is never set in practice (its
++    ``_on_pong`` only accepts a pong whose payload equals "ping", but the
++    ping payload is empty).
++  * Ticks arrive through ``on_data``.
++
++Health = the most recent of {socket opened, last tick, last pong}. A quiet
++market with healthy pongs is healthy; no pong and no tick for
++HEARTBEAT_TIMEOUT is a silent failure.
++
++Timing is controlled: ``clock`` replaces the manager's clock, and ``health``
++replaces the monitor's periodic wait with an explicit pulse.
++"""
++
++from __future__ import annotations
++
++import sys
++import threading
++import types
++
++from datetime import datetime
++
++import pytest
++
++from core.constants import IST
++from data.streams import websocket_manager
++from data.streams.websocket_manager import WebSocketManager
++from tests.data.ws_fakes import FakeAudit, FakeSession, FakeSmartWebSocketV2, wait_until
++
++
++TOKEN = "2885"
++TOKEN_B = "11536"
++TOKEN_C = "1594"
++
++
++def smartapi_message(token: str = TOKEN, ltp_paisa: int = 10_000) -> dict:
++    return {"token": token, "name": "RELIANCE", "last_traded_price": ltp_paisa,
++            "volume_trade_for_the_day": 1_000}
++
++
++# ── Fixtures ─────────────────────────────────────────────────
++
++
++@pytest.fixture
++def sdk(monkeypatch):
++    FakeSmartWebSocketV2.reset([])
++    module = types.ModuleType("SmartApi.smartWebSocketV2")
++    module.SmartWebSocketV2 = FakeSmartWebSocketV2
++    package = types.ModuleType("SmartApi")
++    package.smartWebSocketV2 = module
++    monkeypatch.setitem(sys.modules, "SmartApi", package)
++    monkeypatch.setitem(sys.modules, "SmartApi.smartWebSocketV2", module)
++    return FakeSmartWebSocketV2
++
++
++class Clock:
++    def __init__(self, start: float = 1_700_000_000.0):
++        self.now = start
++
++    def __call__(self) -> float:
++        return self.now
++
++    def advance(self, seconds: float) -> None:
++        self.now += seconds
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    """One controlled timeline for everything the manager times: its
++    ``_clock`` (epoch seconds, as websocket-client stamps pongs) and the
++    ``datetime`` it uses for wall-clock stamps."""
++    clk = Clock()
++
++    class ControlledDatetime(datetime):
++        @classmethod
++        def now(cls, tz=None):
++            return datetime.fromtimestamp(clk.now, tz or IST)
++
++    monkeypatch.setattr(websocket_manager, "datetime", ControlledDatetime)
++    return clk
++
++
++@pytest.fixture
++def ws_manager(sdk, clock, monkeypatch):
++    monkeypatch.setattr(WebSocketManager, "STOP_JOIN_TIMEOUT", 0.2, raising=False)
++    mgr = WebSocketManager(session=FakeSession(), audit=FakeAudit())
++    monkeypatch.setattr(mgr, "_clock", clock, raising=False)
++    yield mgr
++    for client in sdk.instances:
++        client.release_close()
++    mgr.stop()
++    if mgr._ws_thread is not None:
++        mgr._ws_thread.join(timeout=5)
++
++
++@pytest.fixture
++def backoff(ws_manager, monkeypatch):
++    delays: list[float] = []
++
++    def fake_wait(delay, stop_event=None):
++        delays.append(delay)
++
++    monkeypatch.setattr(ws_manager, "_backoff_wait", fake_wait, raising=False)
++    return types.SimpleNamespace(delays=delays)
++
++
++@pytest.fixture
++def health(ws_manager, monkeypatch):
++    """Replace the monitor's periodic wait with an explicit pulse. Each
++    pulse() lets exactly one health check run; a stopped monitor returns
++    immediately so the thread can exit."""
++    pulses = threading.Semaphore(0)
++
++    def fake_wait(stop_event, interval):
++        while not pulses.acquire(timeout=0.02):
++            if stop_event.is_set():
++                return True                          # "stopped": exit loop
++        return stop_event.is_set()
++
++    monkeypatch.setattr(ws_manager, "_monitor_wait", fake_wait, raising=False)
++
++    def pulse():
++        pulses.release()
++
++    return types.SimpleNamespace(pulse=pulse)
++
++
++def monitor_threads() -> list[threading.Thread]:
++    return [t for t in threading.enumerate() if t.name.startswith("ws-health-")]
++
++
++def connect(ws_manager, sdk, script=("stay_open",), tokens=(TOKEN,)):
++    sdk.reset(list(script))
++    ws_manager.subscribe(list(tokens))
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 1 and ws_manager.is_synced)
++    return sdk.instances[0]
++
++
++# ── Silent failure ───────────────────────────────────────────
++
++
++def test_silent_connection_is_detected_and_recovered_through_bounded_policy(
++    ws_manager, sdk, clock, backoff, health
++):
++    """No close callback ever arrives. No tick, no pong for longer than
++    HEARTBEAT_TIMEOUT: the monitor must retire and close the socket so the
++    run loop recovers it like any other disconnect — with backoff."""
++    first = connect(ws_manager, sdk, script=["stay_open", "stay_open"])
++    assert len(monitor_threads()) == 1
++
++    clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT - 1)
++    health.pulse()
++    assert not wait_until(lambda: first.closed_while_open, timeout=0.2)  # not yet silent
++
++    clock.advance(2)                                                    # now past the timeout
++    health.pulse()
++    assert wait_until(lambda: first.closed_while_open)
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++
++    assert "heartbeat" in ws_manager.stats["last_disconnect_reason"]
++    assert ws_manager.stats["silent_failures"] == 1
++    assert backoff.delays == [1.0]                                      # bounded policy
++    assert ws_manager.stats["reconnect_count"] == 1
++    assert sdk.instances[1].frames == [("subscribe", [TOKEN])]
++
++
++# ── Quiet but healthy ────────────────────────────────────────
++
++
++def test_quiet_connection_with_healthy_pongs_stays_connected(
++    ws_manager, sdk, clock, backoff, health
++):
++    """No ticks at all (pre-market), but websocket-client keeps recording
++    pongs every 10 s. Well past HEARTBEAT_TIMEOUT the connection must still
++    be the same, open socket."""
++    first = connect(ws_manager, sdk)
++    ping_interval = 10.0
++    steps = int(WebSocketManager.HEARTBEAT_TIMEOUT * 3 / ping_interval)
++
++    for _ in range(steps):
++        clock.advance(ping_interval)
++        first.wsapp.last_pong_tm = clock.now                            # pong frame arrived
++        health.pulse()
++        assert not wait_until(lambda: first.closed_while_open, timeout=0.05)
++
++    assert ws_manager.is_connected and ws_manager.is_synced
++    assert first._open and not first.closed_while_open
++    assert len(sdk.instances) == 1
++    assert ws_manager.stats["silent_failures"] == 0
++    assert backoff.delays == []
++    assert ws_manager.stats["ticks_received"] == 0
++
++
++def test_ticks_alone_also_count_as_evidence(ws_manager, sdk, clock, backoff, health):
++    first = connect(ws_manager, sdk)
++    for _ in range(5):
++        clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT - 1)
++        first.on_data(first.wsapp, smartapi_message())                  # tick, no pong
++        health.pulse()
++        assert not wait_until(lambda: first.closed_while_open, timeout=0.05)
++    assert ws_manager.is_connected and len(sdk.instances) == 1
++
++
++# ── Periodic retry of pending subscription changes ───────────
++
++
++def test_failed_subscription_is_retried_by_monitor_without_another_change(
++    ws_manager, sdk, clock, backoff, health
++):
++    """The subscribe sent from on_open fails. Nobody calls subscribe() or
++    unsubscribe() again and the connection stays up. The monitor must
++    retry the pending change on its own and succeed."""
++    sdk.subscribe_failures = 1
++    sdk.reset(["stay_open"])
++    sdk.subscribe_failures = 1
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 1 and ws_manager.is_connected)
++    first = sdk.instances[0]
++    assert wait_until(lambda: first.frames == [("subscribe", [TOKEN])])
++    assert ws_manager.pending_changes == {TOKEN}
++    assert not ws_manager.is_synced
++
++    health.pulse()                                                      # healthy: retry
++
++    assert wait_until(lambda: ws_manager.is_synced)
++    assert first.frames == [("subscribe", [TOKEN]), ("subscribe", [TOKEN])]
++    assert first.live == {TOKEN}
++    assert ws_manager.stats["subscription_retries"] == 1
++    assert len(sdk.instances) == 1                                      # no reconnect
++
++
++def test_monitor_retry_respects_capacity_and_frees_slot_before_adding(
++    ws_manager, sdk, clock, backoff, health, monkeypatch
++):
++    """Full connection; unsubscribe(A) fails; replacement Z requested and
++    held back. The monitor's retry must unsubscribe A first and only then
++    send Z — the wire never exceeds the limit."""
++    monkeypatch.setattr(websocket_manager, "SMARTAPI_MAX_TOKENS_PER_CONNECTION", 3)
++    first = connect(ws_manager, sdk, tokens=["A", "B", "C"])
++    assert first.live == {"A", "B", "C"}
++
++    sdk.unsubscribe_failures = 2                                        # fails now and on Z's sync
++    ws_manager.unsubscribe(["A"])                                       # fails, A still live
++    ws_manager.subscribe(["Z"])                                         # accepted, held back
++    assert ws_manager.pending_changes == {"A", "Z"}
++    assert first.live == {"A", "B", "C"}
++
++    health.pulse()
++
++    assert wait_until(lambda: ws_manager.is_synced)
++    assert first.frames[-2:] == [("unsubscribe", ["A"]), ("subscribe", ["Z"])]
++    assert first.live == {"B", "C", "Z"}
++    assert first.peak_live <= 3
++
++
++# ── Ownership: monitor belongs to the current run / generation ─
++
++
++def test_monitor_stops_promptly_on_stop(ws_manager, sdk, clock, health):
++    connect(ws_manager, sdk)
++    assert len(monitor_threads()) == 1
++    ws_manager.stop()
++    assert wait_until(lambda: monitor_threads() == [], timeout=2)
++
++
++def test_old_monitor_exits_on_replacement_and_cannot_close_the_new_socket(
++    ws_manager, sdk, clock, backoff, health
++):
++    first = connect(ws_manager, sdk, script=["stay_open", "stay_open"])
++    (old_monitor,) = monitor_threads()
++
++    first.drop("server_close")
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    second = sdk.instances[1]
++    assert wait_until(lambda: not old_monitor.is_alive(), timeout=2)   # retired with gen 1
++    new_monitors = [t for t in monitor_threads() if t.is_alive()]
++    assert len(new_monitors) == 1 and new_monitors[0] is not old_monitor
++
++    # Even if a retired generation's check ran now, past the timeout, it
++    # must neither close nor reconnect anything.
++    clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT * 2)
++    before = (ws_manager.stats["last_disconnect_reason"], list(backoff.delays))
++    assert ws_manager._health_check(gen=1, client=first) is False
++
++    assert ws_manager.is_connected and ws_manager._ws is second and second._open
++    assert not second.closed_while_open
++    assert (ws_manager.stats["last_disconnect_reason"], backoff.delays) == before
++    assert len(sdk.instances) == 2
++
++    # The current generation's check, on the other hand, sees the silence.
++    second.wsapp.last_pong_tm = clock.now                               # keep it healthy
++    assert ws_manager._health_check(gen=2, client=second) is True
++    assert second._open
++
++
++# ── Bounded recovery vs. silent failures ─────────────────────
++
++
++def silent_cycle(ws_manager, sdk, clock, health, index: int):
++    """Connection ``index`` (1-based) comes up, produces nothing, and is
++    declared silent by the monitor."""
++    assert wait_until(lambda: len(sdk.instances) == index and ws_manager.is_synced)
++    client = sdk.instances[index - 1]
++    clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT + 1)
++    health.pulse()
++    assert wait_until(lambda: client.closed_while_open)
++    return client
++
++
++def test_repeated_silent_connections_exhaust_recovery(
++    ws_manager, sdk, clock, backoff, health
++):
++    """Each silent connection lives HEARTBEAT_TIMEOUT (45 s) before it is
++    closed — longer than STABLE_CONNECTION_SECONDS (30 s). Uptime alone must
++    not reset the budget: a connection that never produced a tick or pong
++    was never healthy, so the run must exhaust after MAX attempts."""
++    attempts = WebSocketManager.MAX_RECONNECT_ATTEMPTS
++    sdk.reset(["stay_open"] * (attempts + 3))
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++
++    for i in range(1, attempts + 2):                 # first try + MAX retries
++        silent_cycle(ws_manager, sdk, clock, health, i)
++
++    assert wait_until(lambda: ws_manager.stats["state"] == "exhausted")
++    ws_manager._ws_thread.join(timeout=5)
++    assert not ws_manager._ws_thread.is_alive()
++    assert backoff.delays == [1.0, 2.0, 4.0, 8.0, 16.0][:attempts]
++    assert ws_manager.stats["silent_failures"] == attempts + 1
++    assert ws_manager.stats["reconnect_count"] == attempts
++    assert len(sdk.instances) == attempts + 1        # no further attempt
++    assert ws_manager.stats["is_running"] is False
++
++
++def test_budget_resets_only_after_genuinely_healthy_operation(
++    ws_manager, sdk, clock, backoff, health
++):
++    """Healthy = evidence kept arriving for at least STABLE_CONNECTION_SECONDS.
++    A single early pong followed by silence, or no evidence at all, does
++    not count however long the socket stayed open."""
++    sdk.reset(["stay_open"] * 5)
++    ws_manager.subscribe([TOKEN])
++    ws_manager.start()
++
++    # 1: healthy for 60 s (pong every 10 s), then silent -> budget reset, attempt 1
++    assert wait_until(lambda: len(sdk.instances) == 1 and ws_manager.is_synced)
++    first = sdk.instances[0]
++    for _ in range(6):
++        clock.advance(10)
++        first.wsapp.last_pong_tm = clock.now
++        health.pulse()
++    clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT + 1)
++    health.pulse()
++    assert wait_until(lambda: first.closed_while_open)
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    assert ws_manager.stats["reconnect_count"] == 1
++
++    # 2: no evidence at all, open 46 s -> attempt 2 (no reset)
++    silent_cycle(ws_manager, sdk, clock, health, 2)
++    assert wait_until(lambda: len(sdk.instances) == 3 and ws_manager.is_synced)
++    assert ws_manager.stats["reconnect_count"] == 2
++
++    # 3: one pong at +10 s, then silent -> healthy for 10 s only -> attempt 3
++    third = sdk.instances[2]
++    clock.advance(10)
++    third.wsapp.last_pong_tm = clock.now
++    health.pulse()
++    clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT + 1)
++    health.pulse()
++    assert wait_until(lambda: third.closed_while_open)
++    assert wait_until(lambda: len(sdk.instances) == 4 and ws_manager.is_synced)
++    assert ws_manager.stats["reconnect_count"] == 3
++
++    # 4: healthy for 40 s, then silent -> reset, attempt 1 again
++    fourth = sdk.instances[3]
++    for _ in range(4):
++        clock.advance(10)
++        fourth.wsapp.last_pong_tm = clock.now
++        health.pulse()
++    clock.advance(WebSocketManager.HEARTBEAT_TIMEOUT + 1)
++    health.pulse()
++    assert wait_until(lambda: fourth.closed_while_open)
++    assert wait_until(lambda: len(sdk.instances) == 5 and ws_manager.is_synced)
++    assert ws_manager.stats["reconnect_count"] == 1
++    assert backoff.delays == [1.0, 2.0, 4.0, 1.0]  # reset, 2nd, 3rd, reset
+diff --git a/AlgoAnalystBackend/tests/data/test_websocket_reconnect.py b/AlgoAnalystBackend/tests/data/test_websocket_reconnect.py
+new file mode 100644
+index 0000000..a99dd2d
+--- /dev/null
++++ b/AlgoAnalystBackend/tests/data/test_websocket_reconnect.py
+@@ -0,0 +1,375 @@
++"""
++Offline regression tests for WebSocketManager reconnect / resubscribe ownership.
++
++The fake below reproduces the behaviour of the SDK the project actually
++installs — verified by driving the real classes' callbacks offline:
++
++    smartapi-python 1.5.5   SmartApi/smartWebSocketV2.py
++    websocket-client 1.9.2  websocket/_app.py  (pinned by requirements.txt;
++                            the SDK does not declare it)
++
++Facts reproduced here:
++
++  * ``connect()`` blocks in ``WebSocketApp.run_forever()`` and RETURNS
++    NORMALLY on handshake refusal, transport error and clean close alike.
++    run_forever swallows the exception, calls ``on_error``, then
++    ``teardown()`` -> ``on_close(wsapp, code, msg)``.
++  * ``SmartWebSocketV2._on_close(self, wsapp)`` cannot accept those three
++    arguments -> TypeError inside ``WebSocketApp._callback`` -> forwarded to
++    ``on_error(wsapp, TypeError)``. The user-level ``on_close`` hook is
++    therefore never invoked; every closure surfaces as an error.
++  * ``SmartWebSocketV2._on_error`` is the SDK's own retry loop: while
++    ``current_retry_attempt < max_retry_attempt`` (default 1) it
++    ``time.sleep(retry_delay=10)`` inside the callback, ``close_connection()``s
++    and calls ``connect()`` recursively. Once exhausted it calls
++    ``on_error("Max retry attempt reached", "Connection closed")``.
++  * ``_on_open`` calls ``resubscribe()`` instead of ``on_open`` whenever
++    ``RESUBSCRIBE_FLAG`` is set. ``resubscribe()`` replays
++    ``input_request_dict``, which ``unsubscribe()`` never prunes — a replay
++    restores tokens the caller cancelled.
++
++Every test runs the manager's real ``start()`` / ``_run()`` / ``_connect()``
++path; only the SDK class, the session, the audit trail and the backoff
++sleep are substituted.
++"""
++
++from __future__ import annotations
++
++import sys
++import threading
++import time
++import types
++
++import pytest
++
++from core.constants import AuditEventType
++from data.streams.websocket_manager import WebSocketManager
++from tests.data.ws_fakes import FakeAudit, FakeSession, FakeSmartWebSocketV2, wait_until
++
++
++TOKEN = "2885"
++TOKEN_B = "11536"
++TOKEN_C = "1594"
++
++
++@pytest.fixture
++def sdk(monkeypatch):
++    """Serve the fake wherever the manager imports SmartWebSocketV2 from."""
++    FakeSmartWebSocketV2.reset([])
++    module = types.ModuleType("SmartApi.smartWebSocketV2")
++    module.SmartWebSocketV2 = FakeSmartWebSocketV2
++    package = types.ModuleType("SmartApi")
++    package.smartWebSocketV2 = module
++    monkeypatch.setitem(sys.modules, "SmartApi", package)
++    monkeypatch.setitem(sys.modules, "SmartApi.smartWebSocketV2", module)
++    return FakeSmartWebSocketV2
++
++
++@pytest.fixture
++def audit():
++    return FakeAudit()
++
++
++@pytest.fixture
++def ws_manager(sdk, audit):
++    mgr = WebSocketManager(session=FakeSession(), audit=audit)
++    yield mgr
++    mgr.stop()
++    if mgr._ws_thread is not None:
++        mgr._ws_thread.join(timeout=5)
++        assert not mgr._ws_thread.is_alive(), "ws thread did not stop"
++
++
++@pytest.fixture
++def backoff(ws_manager, monkeypatch):
++    """Record the manager's backoff waits instead of sleeping. ``gate`` lets a
++    test hold the manager in the disconnected state between attempts."""
++    class Backoff:
++        delays: list[float] = []
++        gate = threading.Event()
++        gate.set()
++
++    def fake_wait(delay, stop_event=None):
++        Backoff.delays.append(delay)
++        Backoff.gate.wait(timeout=5)
++
++    monkeypatch.setattr(ws_manager, "_backoff_wait", fake_wait, raising=False)
++    return Backoff
++
++
++def run_to_completion(ws_manager, timeout: float = 5.0):
++    ws_manager.start()
++    ws_manager._ws_thread.join(timeout=timeout)
++    assert not ws_manager._ws_thread.is_alive(), "manager loop did not finish"
++
++
++# ── Ownership: the SDK's own retry and replay must be off ────
++
++
++def test_sdk_internal_retry_is_disabled_and_each_attempt_uses_a_fresh_client(
++    ws_manager, sdk, backoff
++):
++    """Two retry loops must not compete. The manager owns reconnect, so the
++    SDK is constructed with its retry off, never sleeps inside a callback,
++    never reconnects an instance itself, and resubscribe() is unreachable."""
++    sdk.reset(["server_close", "server_close", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 3 and ws_manager.is_synced)
++
++    for client in sdk.instances:
++        assert client.kwargs["max_retry_attempt"] == 0
++        assert client.sdk_sleeps == []               # SDK loop never ran
++        assert client.connect_calls == 1             # one connect per instance
++        assert client.replayed == []                 # manager did the resubscribe
++    assert [c.frames for c in sdk.instances] == [[("subscribe", [TOKEN])]] * 3
++
++
++# ── Bounded recovery with backoff ────────────────────────────
++
++
++def test_clean_server_close_is_recovered_with_backoff(ws_manager, sdk, backoff):
++    """connect() returns normally on a clean close; that is not success and
++    must not produce an immediate reconnect. Each attempt backs off."""
++    sdk.reset(["server_close", "server_close", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++
++    ws_manager.start()
++    # the first two sessions open briefly, so wait for the third client
++    assert wait_until(lambda: len(sdk.instances) == 3 and ws_manager.is_synced)
++
++    assert backoff.delays == [1.0, 2.0]
++    assert ws_manager.stats["connections_opened"] == 3
++    assert ws_manager.stats["state"] == "connected"
++
++
++def test_transport_error_is_recovered_with_backoff(ws_manager, sdk, backoff):
++    sdk.reset(["transport_error", "transport_error", "stay_open"])
++    ws_manager.subscribe([TOKEN])
++
++    ws_manager.start()
++    assert wait_until(lambda: len(sdk.instances) == 3 and ws_manager.is_synced)
++
++    assert backoff.delays == [1.0, 2.0]
++    assert ws_manager.stats["state"] == "connected"
++    assert "Connection closed" in ws_manager.stats["last_disconnect_reason"]
++
++
++def test_handshake_refusals_are_bounded_and_exhaustion_leaves_status_accurate(
++    ws_manager, sdk, audit, backoff
++):
++    """Repeated refusals: MAX_RECONNECT_ATTEMPTS retries with doubling
++    delay, then the loop gives up. Afterwards nothing may claim to be
++    running, connected or sent; the caller's request survives."""
++    attempts = WebSocketManager.MAX_RECONNECT_ATTEMPTS
++    sdk.reset(["handshake_refused"] * (attempts + 1) + ["stay_open"] * 3)
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++
++    run_to_completion(ws_manager)
++
++    assert backoff.delays == [1.0, 2.0, 4.0, 8.0, 16.0][:attempts]
++    assert len(sdk.instances) == attempts + 1          # first try + retries, no more
++    stats = ws_manager.stats
++    assert stats["state"] == "exhausted"
++    assert stats["is_running"] is False
++    assert stats["is_connected"] is False
++    assert stats["reconnect_exhausted"] is True
++    assert stats["reconnect_count"] == attempts
++    assert stats["connections_opened"] == 0
++    assert stats["sent_tokens"] == 0
++    assert stats["requested_tokens"] == 2              # intent is not lost
++    assert any(
++        et == AuditEventType.ERROR and p.get("component") == "websocket"
++        for et, p in audit.events
++    )
++
++
++def test_start_after_exhaustion_resumes_with_requested_set(ws_manager, sdk, backoff):
++    sdk.reset(["handshake_refused"] * (WebSocketManager.MAX_RECONNECT_ATTEMPTS + 1))
++    ws_manager.subscribe([TOKEN])
++    run_to_completion(ws_manager)
++    assert ws_manager.stats["state"] == "exhausted"
++
++    sdk.reset(["stay_open"])
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.is_synced)
++
++    assert ws_manager.stats["state"] == "connected"
++    assert ws_manager.stats["reconnect_exhausted"] is False
++    assert ws_manager.stats["reconnect_count"] == 0
++    assert sdk.instances[-1].frames == [("subscribe", [TOKEN])]
++
++
++def test_stop_during_backoff_returns_promptly(ws_manager, sdk, monkeypatch):
++    """A real (un-patched) backoff wait must be interruptible by stop()."""
++    monkeypatch.setattr(WebSocketManager, "INITIAL_RECONNECT_DELAY", 30.0)
++    sdk.reset(["server_close", "stay_open"])
++
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.stats["reconnect_count"] == 1)
++    assert not ws_manager.is_connected
++
++    t0 = time.monotonic()
++    ws_manager.stop()
++    ws_manager._ws_thread.join(timeout=5)
++    assert not ws_manager._ws_thread.is_alive()
++    assert time.monotonic() - t0 < 2.0
++    assert ws_manager.stats["state"] == "stopped"
++
++
++# ── Replacement connection gets only the latest requested set ─
++
++
++def test_replacement_connection_receives_only_latest_requested_subscriptions(
++    ws_manager, sdk, backoff
++):
++    """Live on connection 1 with {A, B}. The server drops it. While the
++    manager is backing off the caller cancels A and requests C. Connection 2
++    must receive exactly {B, C}: no replay of A from the SDK's
++    input_request_dict, no double send, nothing from the old connection."""
++    sdk.reset(["stay_open", "stay_open"])
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.is_synced)
++    first = sdk.instances[0]
++    assert first.frames == [("subscribe", [TOKEN_B, TOKEN])]
++
++    backoff.gate.clear()                              # hold the manager in backoff
++    first.drop("server_close")
++    assert wait_until(lambda: backoff.delays == [1.0])
++    assert not ws_manager.is_connected
++    assert ws_manager.sent_count == 0
++
++    ws_manager.unsubscribe([TOKEN])                   # cancel A while disconnected
++    ws_manager.subscribe([TOKEN_C])                   # request C while disconnected
++    assert first.frames == [("subscribe", [TOKEN_B, TOKEN])]   # dead socket untouched
++    assert TOKEN in first.input_request_dict[2][1]    # SDK would still replay A ...
++
++    backoff.gate.set()
++    assert wait_until(lambda: len(sdk.instances) == 2 and ws_manager.is_synced)
++    second = sdk.instances[1]
++
++    assert second is not first                        # ... but it never gets the chance
++    assert second.frames == [("subscribe", [TOKEN_B, TOKEN_C])]
++    assert second.replayed == [] and first.replayed == []
++    assert first.connect_calls == 1
++    assert ws_manager.sent_count == 2
++    assert ws_manager.pending_changes == set()
++
++
++# ── Session expiry: bounded wait, recovery, interruptible ────
++
++
++class MutableSession(FakeSession):
++    def __init__(self, feed_token=None):
++        self.feed_token = feed_token
++
++
++@pytest.fixture
++def clock(ws_manager, monkeypatch):
++    class Clock:
++        now = 1_700_000_000.0
++        def __call__(self):
++            return self.now
++        def advance(self, s):
++            self.now += s
++    clk = Clock()
++    monkeypatch.setattr(ws_manager, "_clock", clk, raising=False)
++    return clk
++
++
++@pytest.fixture
++def session_backoff(ws_manager, clock, monkeypatch):
++    """Record waits and let time pass on the controlled clock instead of
++    sleeping. In stepped mode each wait blocks until ``step()`` releases
++    exactly one cycle."""
++    class Backoff:
++        delays: list[float] = []
++        stepped = False
++        steps = threading.Semaphore(0)
++
++        @classmethod
++        def step(cls):
++            cls.steps.release()
++
++    def fake_wait(delay, stop_event=None):
++        Backoff.delays.append(delay)
++        clock.advance(delay)
++        if Backoff.stepped:
++            assert Backoff.steps.acquire(timeout=5), "wait never released"
++
++    monkeypatch.setattr(ws_manager, "_backoff_wait", fake_wait, raising=False)
++    return Backoff
++
++
++def test_session_expired_wait_is_bounded_and_reports_exhausted(
++    ws_manager, sdk, audit, clock, session_backoff
++):
++    """Credentials never appear. Waiting must stop after
++    MAX_SESSION_EXPIRED_WAIT with a clear 'exhausted' outcome, without
++    ever touching the socket budget."""
++    ws_manager._session = MutableSession(feed_token=None)
++    sdk.reset(["stay_open"])
++    ws_manager.subscribe([TOKEN])
++
++    run_to_completion(ws_manager)
++
++    limit = WebSocketManager.MAX_SESSION_EXPIRED_WAIT
++    expected_waits = -(-limit // WebSocketManager.SESSION_EXPIRED_WAIT)   # ceil
++    assert session_backoff.delays == [WebSocketManager.SESSION_EXPIRED_WAIT] * int(expected_waits)
++    stats = ws_manager.stats
++    assert stats["state"] == "exhausted"
++    assert stats["is_running"] is False
++    assert stats["reconnect_exhausted"] is True
++    assert "session expired" in stats["last_disconnect_reason"]
++    assert stats["reconnect_count"] == 0                # socket budget untouched
++    assert len(sdk.instances) == 0                      # never built a client
++    assert stats["requested_tokens"] == 1
++    assert any(
++        et == AuditEventType.ERROR and "session" in p.get("error", "")
++        for et, p in audit.events
++    )
++
++
++def test_session_expired_recovers_when_credentials_become_available(
++    ws_manager, sdk, clock, session_backoff
++):
++    session = MutableSession(feed_token=None)
++    ws_manager._session = session
++    sdk.reset(["stay_open"])
++    ws_manager.subscribe([TOKEN])
++    session_backoff.stepped = True
++
++    ws_manager.start()
++    assert wait_until(lambda: len(session_backoff.delays) == 1)
++    assert ws_manager.stats["state"] == "waiting_for_session"
++    assert ws_manager.stats["session_wait_s"] == 0
++    session_backoff.step()                              # one more wait cycle ...
++    assert wait_until(lambda: len(session_backoff.delays) == 2)
++    assert ws_manager.stats["session_wait_s"] == WebSocketManager.SESSION_EXPIRED_WAIT
++    session.feed_token = "feed"                         # ... then re-auth completes
++    session_backoff.step()
++
++    assert wait_until(lambda: ws_manager.is_synced)
++    assert ws_manager.stats["state"] == "connected"
++    assert ws_manager.stats["reconnect_count"] == 0
++    assert ws_manager.stats["session_wait_s"] == 0
++    assert sdk.instances[0].frames == [("subscribe", [TOKEN])]
++
++
++def test_stop_interrupts_session_expired_wait(ws_manager, sdk, monkeypatch):
++    """Un-patched wait: stop() must wake it immediately."""
++    monkeypatch.setattr(WebSocketManager, "SESSION_EXPIRED_WAIT", 30.0)
++    ws_manager._session = MutableSession(feed_token=None)
++
++    ws_manager.start()
++    assert wait_until(lambda: ws_manager.stats["state"] == "waiting_for_session")
++
++    t0 = time.monotonic()
++    ws_manager.stop()
++    ws_manager._ws_thread.join(timeout=5)
++    assert not ws_manager._ws_thread.is_alive()
++    assert time.monotonic() - t0 < 2.0
++    assert ws_manager.stats["state"] == "stopped"
++    assert len(sdk.instances) == 0
+diff --git a/AlgoAnalystBackend/tests/data/test_websocket_subscriptions.py b/AlgoAnalystBackend/tests/data/test_websocket_subscriptions.py
+new file mode 100644
+index 0000000..a88b131
+--- /dev/null
++++ b/AlgoAnalystBackend/tests/data/test_websocket_subscriptions.py
+@@ -0,0 +1,482 @@
++"""
++Offline regression tests for WebSocketManager subscription bookkeeping.
++
++No broker, no network, no background thread. A fake socket stands in for
++``SmartWebSocketV2``; it records every subscribe/unsubscribe request and
++fires the manager's ``on_open`` / ``on_close`` hooks with the same
++arguments the SDK uses, so the manager's callbacks run through their
++genuine code paths.
++
++Production call order (main.py) is always:
++
++    ws_manager.subscribe(all_tokens)   # before the socket exists
++    ws_manager.start()                 # -> _connect -> SmartWebSocketV2.connect
++                                       # -> on_open -> sync requested set
++
++The manager keeps two distinct sets:
++
++    requested   what the caller wants streamed (source of truth)
++    sent        what was handed to the SDK without error on the *current*
++                connection — NOT a broker acknowledgment; the SDK exposes
++                none, and the fake models none.
++
++SDK hook contract (smartapi-python 1.5.5, SmartApi/smartWebSocketV2.py):
++
++    on_open(wsapp)
++    on_data(wsapp, message)
++    on_error(wsapp, error)          # or ("Max retry attempt reached", "Connection closed")
++    on_close(wsapp)                 # declared form; in practice never reached, because
++                                    # the SDK's own _on_close(wsapp) wrapper rejects
++                                    # websocket-client's (wsapp, code, msg) and the
++                                    # close is forwarded to on_error instead.
++
++These tests drive the hooks directly to exercise subscription bookkeeping;
++reconnect ownership is covered in test_websocket_reconnect.py.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from core.constants import SMARTAPI_MAX_TOKENS_PER_CONNECTION
++from core.exceptions import WebSocketError
++from data.streams import websocket_manager
++from data.streams.websocket_manager import WebSocketManager
++
++
++TOKEN = "2885"      # RELIANCE
++TOKEN_B = "11536"   # TCS
++TOKEN_C = "1594"    # INFY
++
++
++# ── Test doubles ─────────────────────────────────────────────
++
++
++class FakeSocket:
++    """Minimal stand-in for SmartApi.smartWebSocketV2.SmartWebSocketV2.
++
++    Only the surface WebSocketManager touches is implemented.
++
++    * ``connect()`` invokes ``on_open(wsapp)`` synchronously (the real client
++      does so from its socket thread once the handshake completes).
++    * ``close_connection()`` invokes ``on_close(wsapp)`` — one argument, as
++      the SDK's ``_on_close(wsapp, code, msg)`` forwards only ``wsapp``.
++    * ``subscribe``/``unsubscribe`` record the request and return, or raise
++      when told to. Returning is "sent"; no acknowledgment is modelled
++      because the SDK provides none.
++    """
++
++    def __init__(self, fail_subscribes: int = 0, fail_unsubscribes: int = 0):
++        self.calls: list[tuple[str, list[str]]] = []   # ("subscribe"|"unsubscribe", tokens)
++        self.fail_subscribes = fail_subscribes          # raise on the next N subscribe calls
++        self.fail_unsubscribes = fail_unsubscribes      # raise on the next N unsubscribe calls
++        self.close_args: list[tuple] = []               # what on_close was invoked with
++        self.live: set[str] = set()                     # tokens actually on the wire
++        self.peak_live = 0                              # most tokens ever live at once
++        self.on_open = None
++        self.on_data = None
++        self.on_error = None
++        self.on_close = None
++
++    # -- SmartWebSocketV2 API used by the manager --
++
++    def connect(self):
++        self.live.clear()                               # a new socket starts empty
++        self.on_open(self)
++
++    def close_connection(self):
++        args = (self,)
++        self.close_args.append(args)
++        self.on_close(*args)                            # SDK contract: on_close(wsapp)
++
++    def subscribe(self, correlation_id, mode, token_list):
++        tokens = [t for entry in token_list for t in entry["tokens"]]
++        self.calls.append(("subscribe", sorted(tokens)))
++        if self.fail_subscribes > 0:
++            self.fail_subscribes -= 1
++            raise RuntimeError("simulated send failure")   # nothing reached the wire
++        self.live |= set(tokens)
++        self.peak_live = max(self.peak_live, len(self.live))
++
++    def unsubscribe(self, correlation_id, mode, token_list):
++        tokens = [t for entry in token_list for t in entry["tokens"]]
++        self.calls.append(("unsubscribe", sorted(tokens)))
++        if self.fail_unsubscribes > 0:
++            self.fail_unsubscribes -= 1
++            raise RuntimeError("simulated send failure")   # slot NOT freed
++        self.live -= set(tokens)
++
++    # -- assertion helpers --
++
++    def tokens_sent(self, kind: str) -> list[str]:
++        return sorted(t for k, toks in self.calls if k == kind for t in toks)
++
++
++def open_connection(ws_manager: WebSocketManager, socket: FakeSocket) -> None:
++    """What WebSocketManager._connect() does once it has built a client:
++    attach it as the current socket generation (binding the hooks) and let
++    the SDK open it. Minus the SmartApi import and credential lookup."""
++    ws_manager._attach_socket(socket)
++    socket.connect()
++
++
++class FakeAudit:
++    def log(self, event_type, payload):
++        pass
++
++
++@pytest.fixture
++def ws_manager():
++    # __init__ only stores session/audit; nothing connects. Opening a socket
++    # (open_connection) starts that generation's health monitor, so the
++    # manager is stopped at teardown like any real one.
++    mgr = WebSocketManager(session=None, audit=FakeAudit())
++    yield mgr
++    mgr.stop()
++
++
++@pytest.fixture
++def small_limit(monkeypatch):
++    """Shrink the per-connection cap so capacity scenarios stay readable.
++    The real value is asserted separately in the single-connection test."""
++    monkeypatch.setattr(websocket_manager, "SMARTAPI_MAX_TOKENS_PER_CONNECTION", 3)
++    return 3
++
++
++def tokens(n: int, prefix: str = "T") -> list[str]:
++    return [f"{prefix}{i}" for i in range(n)]
++
++
++# ── Cancel before the socket opens ───────────────────────────
++
++
++def test_token_cancelled_before_connection_opens_is_never_subscribed(ws_manager):
++    """subscribe([A, B]) then unsubscribe([A]) while still offline.
++
++    When the socket opens only B may be sent; A was cancelled before it was
++    ever on the wire and must not be resurrected by on_open.
++    """
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++    ws_manager.unsubscribe([TOKEN])
++    assert ws_manager.requested_count == 1
++    assert ws_manager.sent_count == 0               # nothing on the wire yet
++    assert ws_manager.pending_changes == {TOKEN_B}
++
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++
++    assert ws_manager.is_connected
++    assert socket.calls == [("subscribe", [TOKEN_B])]
++    assert socket.tokens_sent("unsubscribe") == []  # nothing to undo for A
++    assert ws_manager.sent_count == 1
++    assert ws_manager.pending_changes == set()
++
++
++# ── Opening a connection sends each request exactly once ─────
++
++
++def test_open_sends_requested_set_once_and_reconnect_sends_it_once_again(ws_manager):
++    """The old on_open sent the pending batch and then immediately re-sent
++    the same tokens through its "re-subscribe on reconnect" branch. Each
++    open must send the requested set exactly once."""
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    assert socket.calls == [("subscribe", [TOKEN_B, TOKEN])]
++
++    socket.close_connection()
++    assert ws_manager.sent_count == 0               # per-connection, gone with the socket
++    assert ws_manager.requested_count == 2          # the request itself survives
++
++    open_connection(ws_manager, socket)
++    assert socket.calls == [
++        ("subscribe", [TOKEN_B, TOKEN]),
++        ("subscribe", [TOKEN_B, TOKEN]),
++    ]
++    assert ws_manager.sent_count == 2
++
++
++# ── Failed subscribe stays retryable ─────────────────────────
++
++
++def test_failed_subscribe_on_open_is_retried_on_next_open(ws_manager):
++    """The SDK raises on the subscribe issued from on_open. The token was
++    requested and never sent, so the next open must send it again."""
++    ws_manager.subscribe([TOKEN])
++
++    socket = FakeSocket(fail_subscribes=1)
++    open_connection(ws_manager, socket)
++
++    assert socket.calls == [("subscribe", [TOKEN])]
++    assert ws_manager.sent_count == 0
++    assert ws_manager.pending_changes == {TOKEN}    # still owed to the caller
++
++    socket.close_connection()
++    open_connection(ws_manager, socket)
++
++    assert socket.calls == [("subscribe", [TOKEN]), ("subscribe", [TOKEN])]
++    assert ws_manager.sent_count == 1
++    assert ws_manager.pending_changes == set()
++
++
++def test_failed_subscribe_is_retried_on_next_change_while_still_connected(ws_manager):
++    """No reconnect needed: the next subscription change on the same
++    connection re-sends the token that failed earlier alongside the new one."""
++    ws_manager.subscribe([TOKEN])
++    socket = FakeSocket(fail_subscribes=1)
++    open_connection(ws_manager, socket)
++    assert ws_manager.pending_changes == {TOKEN}
++
++    ws_manager.subscribe([TOKEN_B])                 # connected: sent immediately
++
++    assert socket.calls == [
++        ("subscribe", [TOKEN]),                     # rejected
++        ("subscribe", [TOKEN_B, TOKEN]),            # retried together with B
++    ]
++    assert ws_manager.sent_count == 2
++    assert ws_manager.pending_changes == set()
++
++
++# ── Failed unsubscribe stays retryable ───────────────────────
++
++
++def test_failed_unsubscribe_keeps_token_as_sent_and_retries_on_next_change(ws_manager):
++    """The token is no longer requested but is still live on the socket
++    because the unsubscribe send failed. It must stay counted as sent, and
++    the next change must retry the unsubscribe before doing anything else."""
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++    socket = FakeSocket(fail_unsubscribes=1)
++    open_connection(ws_manager, socket)
++
++    ws_manager.unsubscribe([TOKEN])
++
++    assert socket.calls[-1] == ("unsubscribe", [TOKEN])
++    assert ws_manager.requested_count == 1
++    assert ws_manager.sent_count == 2               # still on the wire
++    assert ws_manager.pending_changes == {TOKEN}
++
++    ws_manager.subscribe([TOKEN_C])
++
++    assert socket.calls[-2:] == [
++        ("unsubscribe", [TOKEN]),                   # retried, now succeeds
++        ("subscribe", [TOKEN_C]),
++    ]
++    assert ws_manager.sent_count == 2               # B and C
++    assert ws_manager.pending_changes == set()
++
++
++def test_failed_unsubscribe_is_dropped_on_reconnect_not_resent(ws_manager):
++    """After a failed unsubscribe the token is 'sent but not requested'.
++    A fresh connection starts empty, so the only thing to do is not send it."""
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++    socket = FakeSocket(fail_unsubscribes=1)
++    open_connection(ws_manager, socket)
++    ws_manager.unsubscribe([TOKEN])
++    assert ws_manager.pending_changes == {TOKEN}
++
++    socket.close_connection()
++    open_connection(ws_manager, socket)
++
++    assert socket.calls[-1] == ("subscribe", [TOKEN_B])
++    assert socket.calls.count(("unsubscribe", [TOKEN])) == 1   # not retried on a new socket
++    assert ws_manager.sent_count == 1
++    assert ws_manager.pending_changes == set()
++
++
++# ── Changes while disconnected ───────────────────────────────
++
++
++def test_changes_while_disconnected_are_not_sent_and_are_applied_on_reopen(ws_manager):
++    """Between a close and the next open, subscribe/unsubscribe must only
++    update the requested set. Nothing may be written to the dead socket,
++    and the reopen must send exactly the final requested set."""
++    ws_manager.subscribe([TOKEN, TOKEN_B])
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    socket.close_connection()
++    assert not ws_manager.is_connected
++    calls_before = list(socket.calls)
++
++    ws_manager.unsubscribe([TOKEN])                 # drop A
++    ws_manager.subscribe([TOKEN_C])                 # add C
++    ws_manager.subscribe([TOKEN_B])                 # B already requested: no-op
++
++    assert socket.calls == calls_before             # dead socket untouched
++    assert ws_manager.requested_count == 2
++    assert ws_manager.sent_count == 0
++    assert ws_manager.pending_changes == {TOKEN_B, TOKEN_C}
++
++    open_connection(ws_manager, socket)
++
++    assert socket.calls[len(calls_before):] == [("subscribe", [TOKEN_B, TOKEN_C])]
++    assert ws_manager.pending_changes == set()
++
++
++def test_subscribe_while_connected_is_sent_immediately(ws_manager):
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    assert socket.calls == []                       # nothing requested yet
++
++    ws_manager.subscribe([TOKEN])
++    assert socket.calls == [("subscribe", [TOKEN])]
++    assert ws_manager.sent_count == 1
++
++    ws_manager.unsubscribe([TOKEN])
++    assert socket.calls[-1] == ("unsubscribe", [TOKEN])
++    assert ws_manager.sent_count == 0
++    assert ws_manager.requested_count == 0
++
++
++# ── SDK close-callback contract ──────────────────────────────
++
++
++def test_on_close_accepts_sdk_single_argument_form(ws_manager):
++    """The SDK's declared hook form is ``on_close(wsapp)``. A hook that
++    requires code/msg would raise TypeError inside the SDK. (With the SDK
++    actually installed the hook never fires at all — see module docstring —
++    which is why the manager also treats on_error / connect() returning as
++    the close signal; that path is covered in test_websocket_reconnect.py.)"""
++    ws_manager.subscribe([TOKEN])
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    assert ws_manager.is_connected
++
++    socket.close_connection()                       # fake calls on_close(wsapp)
++
++    assert socket.close_args == [(socket,)]         # contract: exactly one argument
++    assert not ws_manager.is_connected
++    assert ws_manager.sent_count == 0
++    assert ws_manager.requested_count == 1
++
++
++def test_on_close_still_accepts_websocket_client_three_argument_form(ws_manager):
++    """Defensive: if the hook is ever wired straight to websocket-client,
++    (wsapp, close_status_code, close_msg) must also work."""
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++
++    socket.on_close(socket, 1006, "abnormal closure")   # via the bound hook
++
++    assert not ws_manager.is_connected
++
++
++# ── Sent is not acknowledged ─────────────────────────────────
++
++
++def test_sent_means_handed_to_sdk_on_this_connection_not_broker_ack(ws_manager):
++    """A request that the SDK accepted without error counts as *sent*. That
++    is all the manager can know (no ack exists); it is scoped to the current
++    connection and reported under that name, not as 'subscribed'."""
++    ws_manager.subscribe([TOKEN])
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++
++    stats = ws_manager.stats
++    assert stats["requested_tokens"] == 1
++    assert stats["sent_tokens"] == 1
++    assert stats["pending_changes"] == 0
++    assert "subscribed_tokens" not in stats         # no claim of confirmation
++
++    socket.close_connection()
++    stats = ws_manager.stats
++    assert stats["requested_tokens"] == 1           # the caller's intent persists
++    assert stats["sent_tokens"] == 0                # but nothing is sent on a closed socket
++    assert stats["pending_changes"] == 1
++
++
++# ── Capacity: one connection, distinct tokens ────────────────
++
++
++def test_capacity_is_the_single_connection_limit(ws_manager):
++    """_connect() creates exactly one SmartWebSocketV2, so the cap is the
++    per-connection limit — not per-connection × max connections."""
++    full = tokens(SMARTAPI_MAX_TOKENS_PER_CONNECTION)
++    ws_manager.subscribe(full)                      # offline: all pending, all count
++    assert ws_manager.requested_count == SMARTAPI_MAX_TOKENS_PER_CONNECTION
++
++    with pytest.raises(WebSocketError) as exc:
++        ws_manager.subscribe(["one-too-many"])
++    assert exc.value.details["limit"] == SMARTAPI_MAX_TOKENS_PER_CONNECTION
++
++
++def test_pending_and_sent_requests_both_count_toward_capacity(ws_manager, small_limit):
++    """Two sent on the open socket + one requested while offline = full.
++    The offline request occupies a slot even though it is not on the wire."""
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    ws_manager.subscribe(tokens(2))                 # sent
++    socket.close_connection()
++    ws_manager.subscribe(["T2"])                    # pending (offline)
++    assert ws_manager.sent_count == 0
++    assert ws_manager.requested_count == 3
++
++    with pytest.raises(WebSocketError):
++        ws_manager.subscribe(["T3"])
++
++
++def test_repeated_requests_do_not_consume_extra_capacity(ws_manager, small_limit):
++    """Re-requesting tokens already requested (pending or sent), or listing
++    a token twice in one call, must neither raise nor re-send."""
++    ws_manager.subscribe(tokens(3))                 # full, all pending
++    ws_manager.subscribe(tokens(3))                 # same again: fine
++    ws_manager.subscribe(["T0", "T0", "T1"])        # duplicates within a call: fine
++    assert ws_manager.requested_count == 3
++
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    ws_manager.subscribe(tokens(3))                 # now all sent: still fine
++    assert socket.calls == [("subscribe", tokens(3))]
++    assert ws_manager.sent_count == 3
++
++
++def test_rejected_oversized_request_leaves_requested_set_unchanged(ws_manager, small_limit):
++    """An over-limit call must be rejected as a whole: no token from it may
++    be recorded, queued or sent — including the ones that would have fit."""
++    ws_manager.subscribe(tokens(2))
++    socket = FakeSocket()
++    open_connection(ws_manager, socket)
++    before = list(socket.calls)
++
++    with pytest.raises(WebSocketError):
++        ws_manager.subscribe(["X", "Y"])            # 2 + 2 > 3
++
++    assert ws_manager.requested_count == 2
++    assert ws_manager.pending_changes == set()
++    assert socket.calls == before                   # nothing partial went out
++    assert socket.live == {"T0", "T1"}
++
++
++# ── Full connection: replacement must wait for a freed slot ──
++
++
++def test_replacement_is_not_sent_until_failed_unsubscribe_frees_its_slot(
++    ws_manager, small_limit
++):
++    """Connection is full. unsubscribe(A) fails, so A still occupies a slot.
++    Requesting replacement Z is legal (the *requested* set is within the
++    limit) but Z must not be sent while A is still live; the wire must
++    never hold more than the limit. Once the unsubscribe succeeds, Z goes."""
++    ws_manager.subscribe(["A", "B", "C"])
++    socket = FakeSocket(fail_unsubscribes=2)
++    open_connection(ws_manager, socket)
++    assert socket.live == {"A", "B", "C"}
++
++    ws_manager.unsubscribe(["A"])                   # fails (1/2): A still live
++    ws_manager.subscribe(["Z"])                     # accepted: requested = {B, C, Z}
++
++    # sync retried the unsubscribe (fails 2/2) and must then hold Z back
++    assert socket.calls[-1] == ("unsubscribe", ["A"])
++    assert socket.tokens_sent("subscribe").count("Z") == 0
++    assert socket.live == {"A", "B", "C"}
++    assert socket.peak_live <= small_limit
++    assert ws_manager.requested_count == 3
++    assert ws_manager.sent_count == 3               # A, B, C
++    assert ws_manager.pending_changes == {"A", "Z"}
++
++    ws_manager.subscribe(["Z"])                     # any change retries the sync
++
++    assert socket.calls[-2:] == [("unsubscribe", ["A"]), ("subscribe", ["Z"])]
++    assert socket.live == {"B", "C", "Z"}
++    assert socket.peak_live <= small_limit
++    assert ws_manager.pending_changes == set()
+diff --git a/AlgoAnalystBackend/tests/data/ws_fakes.py b/AlgoAnalystBackend/tests/data/ws_fakes.py
+new file mode 100644
+index 0000000..5f9be93
+--- /dev/null
++++ b/AlgoAnalystBackend/tests/data/ws_fakes.py
+@@ -0,0 +1,260 @@
++"""
++Offline test doubles for WebSocketManager.
++
++FakeSmartWebSocketV2 reproduces the behaviour of the SDK the project installs
++— smartapi-python 1.5.5 on websocket-client 1.9.2 — verified by driving the
++real classes' callbacks offline. See test_websocket_reconnect.py for the
++list of reproduced facts.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++import types
++from collections import deque
++
++from core.constants import AuditEventType
++
++
++# ── SDK-faithful fake ─────────────────────────────────────────
++
++
++class WebSocketConnectionClosedException(Exception):
++    """websocket._exceptions.WebSocketConnectionClosedException stand-in."""
++
++
++class FakeSmartWebSocketV2:
++    """Behavioural replica of smartapi-python 1.5.5 ``SmartWebSocketV2`` on
++    top of websocket-client 1.9.2 ``WebSocketApp``, for the surface the
++    manager touches. One instance == one SDK object; ``connect()`` runs the
++    next scripted session outcome synchronously (it "is" run_forever).
++
++    Session outcomes (``FakeSmartWebSocketV2.script``):
++        "handshake_refused"  run_forever: on_error(ConnectionRefusedError)
++                             then teardown -> on_close(None, None); returns.
++        "server_close"       open, then teardown -> on_close(1000, msg).
++        "transport_error"    open, then on_error(ConnectionResetError) and
++                             teardown -> on_close(None, None).
++        "stay_open"          open and block until close_connection() or
++                             drop(<outcome>) is called from the test.
++    """
++
++    script: deque[str] = deque()
++    instances: list["FakeSmartWebSocketV2"] = []
++    # Test hooks consumed per connect() call, in order. A gate holds
++    # connect() *before* it builds its WebSocketApp — the thread is
++    # "descheduled" between the manager attaching the client and the SDK
++    # opening it — which is exactly when close_connection() is a no-op.
++    connect_gates: deque[threading.Event | None] = deque()
++    subscribe_delay: float = 0.0                     # seconds each subscribe() takes
++    subscribe_failures: int = 0                      # next N subscribe() calls raise
++    unsubscribe_failures: int = 0                    # next N unsubscribe() calls raise
++
++    def __init__(self, auth_token, api_key, client_code, feed_token,
++                 max_retry_attempt=1, retry_strategy=0, retry_delay=10,
++                 retry_multiplier=2, retry_duration=60):
++        assert all([auth_token, api_key, client_code, feed_token])  # SDK _sanity_check
++        self.kwargs = dict(max_retry_attempt=max_retry_attempt, retry_delay=retry_delay)
++        self.RESUBSCRIBE_FLAG = False
++        self.DISCONNECT_FLAG = True
++        self.MAX_RETRY_ATTEMPT = max_retry_attempt
++        self.retry_delay = retry_delay
++        self.current_retry_attempt = 0
++        self.input_request_dict: dict = {}
++        self.wsapp = None
++        # user hooks (SDK defaults are no-ops)
++        self.on_open = lambda wsapp: None
++        self.on_data = lambda wsapp, data: None
++        self.on_close = lambda wsapp: None
++        self.on_error = lambda *args: None
++        # observability
++        self.connect_calls = 0
++        self.close_calls = 0
++        self.closed_while_open = False                   # close_connection() hit a live session
++        self.frames: list[tuple[str, list[str]]] = []   # frames actually sent
++        self.live: set[str] = set()                      # tokens live on the wire
++        self.peak_live = 0
++        self.last_pong_timestamp = None                  # SDK attr; never set in practice
++        self.replayed: list[str] = []                    # tokens resubscribe() replayed
++        self.sdk_sleeps: list[float] = []                # SDK-internal retry sleeps
++        self._open = False
++        self._drop: str | None = None
++        self._session_over = threading.Event()
++        # Test hook: when True, close_connection() is acknowledged but the
++        # session (run_forever) only ends once release_close() is called —
++        # i.e. the connection attempt is "still finishing".
++        self.close_blocks = False
++        self.close_requested = threading.Event()
++        type(self).instances.append(self)
++
++    @classmethod
++    def reset(cls, script: list[str]):
++        cls.script = deque(script)
++        cls.instances = []
++        cls.connect_gates = deque()
++        cls.subscribe_delay = 0.0
++        cls.subscribe_failures = 0
++        cls.unsubscribe_failures = 0
++
++    # -- websocket-client WebSocketApp._callback --------------------------
++
++    def _wc_callback(self, callback, *args):
++        try:
++            callback(self.wsapp, *args)
++        except Exception as e:                       # "error from callback ..."
++            if callback is not self._on_error:
++                self._on_error(self.wsapp, e)
++
++    # -- SDK wrappers registered with WebSocketApp ------------------------
++
++    def _on_open(self, wsapp):
++        if self.RESUBSCRIBE_FLAG:
++            self.resubscribe()
++        else:
++            self.on_open(wsapp)
++
++    def _on_close(self, wsapp):                      # one parameter, as in the SDK
++        self.on_close(wsapp)
++
++    def _on_error(self, wsapp, error):
++        self.RESUBSCRIBE_FLAG = True
++        if self.current_retry_attempt < self.MAX_RETRY_ATTEMPT:
++            self.current_retry_attempt += 1
++            self.sdk_sleeps.append(self.retry_delay)  # time.sleep(retry_delay)
++            try:
++                self.close_connection()
++                self.connect()                       # recursive reconnect
++            except Exception as e:
++                self.on_error("Reconnect Error", str(e) or "Unknown error")
++        else:
++            self.close_connection()
++            self.on_error("Max retry attempt reached", "Connection closed")
++
++    # -- public SDK API ----------------------------------------------------
++
++    def connect(self):
++        self.connect_calls += 1
++        gate = type(self).connect_gates.popleft() if type(self).connect_gates else None
++        if gate is not None:
++            assert gate.wait(timeout=5), "connect gate never released"
++        # a fresh websocket.WebSocketApp: last_pong_tm/last_ping_tm are the
++        # only heartbeat evidence the stack exposes (set on every pong frame)
++        self.wsapp = types.SimpleNamespace(last_pong_tm=0.0, last_ping_tm=0.0)
++        self.DISCONNECT_FLAG = False
++        self._session_over.clear()
++        outcome = type(self).script.popleft() if type(self).script else "stay_open"
++
++        if outcome == "handshake_refused":
++            self._wc_callback(self._on_error, ConnectionRefusedError("refused"))
++            self._wc_callback(self._on_close, None, None)
++            return
++
++        self._open = True
++        self._wc_callback(self._on_open)
++
++        if outcome == "stay_open":
++            assert self._session_over.wait(timeout=5), "session never ended"
++            outcome = self._drop or "client_close"
++
++        self._open = False
++        if outcome == "client_close":
++            self._wc_callback(self._on_close, 1000, "client closed")
++        elif outcome == "server_close":
++            self._wc_callback(self._on_close, 1000, "server going away")
++        elif outcome == "transport_error":
++            self._wc_callback(self._on_error, ConnectionResetError("peer reset"))
++            self._wc_callback(self._on_close, None, None)
++        else:
++            raise AssertionError(f"unknown outcome {outcome!r}")
++
++    def close_connection(self):
++        self.RESUBSCRIBE_FLAG = False
++        self.DISCONNECT_FLAG = True
++        self.close_calls += 1
++        self.close_requested.set()
++        if self.wsapp is None:
++            return                                   # SDK: nothing to close yet
++        if self._open:
++            self.closed_while_open = True
++        if not self.close_blocks:
++            self._session_over.set()
++
++    def release_close(self):
++        """Test hook: let a blocked close_connection() finish the session."""
++        self._session_over.set()
++
++    def drop(self, outcome: str):
++        """Test hook: the server/transport ends a 'stay_open' session."""
++        self._drop = outcome
++        self._session_over.set()
++
++    def _send(self, action: str, token_list):
++        if not self._open:
++            raise WebSocketConnectionClosedException("Connection is already closed.")
++        tokens = [t for entry in token_list for t in entry["tokens"]]
++        self.frames.append((action, sorted(tokens)))
++        cls = type(self)
++        if action == "subscribe" and cls.subscribe_failures > 0:
++            cls.subscribe_failures -= 1
++            raise WebSocketConnectionClosedException("simulated send failure")
++        if action == "unsubscribe" and cls.unsubscribe_failures > 0:
++            cls.unsubscribe_failures -= 1
++            raise WebSocketConnectionClosedException("simulated send failure")
++        if action == "subscribe":
++            self.live |= set(tokens)
++            self.peak_live = max(self.peak_live, len(self.live))
++        else:
++            self.live -= set(tokens)
++
++    def subscribe(self, correlation_id, mode, token_list):
++        for entry in token_list:                     # SDK records for replay ...
++            bucket = self.input_request_dict.setdefault(mode, {})
++            bucket.setdefault(entry["exchangeType"], []).extend(entry["tokens"])
++        if type(self).subscribe_delay:
++            time.sleep(type(self).subscribe_delay)
++        self._send("subscribe", token_list)
++        self.RESUBSCRIBE_FLAG = True
++
++    def unsubscribe(self, correlation_id, mode, token_list):
++        # ... and never prunes on unsubscribe.
++        self._send("unsubscribe", token_list)
++        self.RESUBSCRIBE_FLAG = True
++
++    def resubscribe(self):
++        for mode, by_exchange in self.input_request_dict.items():
++            for tokens in by_exchange.values():
++                self.replayed.extend(tokens)
++                self.frames.append(("subscribe", sorted(tokens)))
++
++
++# ── Other doubles ─────────────────────────────────────────────
++
++
++class FakeVault:
++    def get_credential(self, name):
++        return "api-key"
++
++
++class FakeSession:
++    _vault = FakeVault()
++    client_id = "C123"
++    feed_token = "feed"
++    jwt_token = "jwt"
++
++
++class FakeAudit:
++    def __init__(self):
++        self.events: list[tuple[AuditEventType, dict]] = []
++
++    def log(self, event_type, payload):
++        self.events.append((event_type, payload))
++
++
++def wait_until(predicate, timeout: float = 5.0) -> bool:
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if predicate():
++            return True
++        time.sleep(0.005)
++    return predicate()

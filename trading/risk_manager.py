@@ -21,7 +21,7 @@ All thresholds are configurable via app_config (runtime-tunable).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import Any
 
 from loguru import logger
@@ -94,6 +94,11 @@ class RiskManager:
         self._daily_unrealized_pnl: float = 0.0
         self._daily_trades: int = 0
         self._trade_date: datetime | None = None
+        # Entry holds: key -> (reason, trading day). While any hold is in
+        # place, orders that add exposure are rejected. Holds are scoped to
+        # the day they were placed (see reset_daily) and can be released
+        # individually (e.g. "data_unverified" once a warm-up succeeds).
+        self._entry_holds: dict[str, tuple[str, date]] = {}
 
         # Weekly tracking
         self._weekly_pnl: float = 0.0
@@ -122,6 +127,11 @@ class RiskManager:
             if rejection:
                 return rejection
 
+            # Gate 1b: New entries closed for the day (after square-off)
+            rejection = self._check_entries_closed(order, positions)
+            if rejection:
+                return rejection
+
             # Gate 2: Position limits
             rejection = self._check_position_limits(order, positions, sector)
             if rejection:
@@ -132,8 +142,13 @@ class RiskManager:
             if rejection:
                 return rejection
 
-            # Gate 4: Capital allocation
-            max_value = self._get_max_trade_value(positions)
+            # Gate 4: Capital allocation. A SELL reduces exposure and takes
+            # no allocation, so deployed capital cannot block an exit; it
+            # is still sized by the per-trade cap (and capped to the
+            # holding by the execution path).
+            max_value = self._get_max_trade_value(
+                positions, reducing=(order.transaction_type == TransactionType.SELL),
+            )
             if max_value <= 0:
                 return self._reject(
                     order, "Capital fully deployed — no allocation available"
@@ -214,6 +229,40 @@ class RiskManager:
                 )
         return None
 
+    def _check_entries_closed(
+        self, order: OrderRequest, positions: list[Position]
+    ) -> RiskDecision | None:
+        """
+        Gate 1b: Are new entries closed for the day?
+
+        Set by the intraday square-off (scheduled or replayed after a
+        restart) and cleared by reset_daily() at the next pre-market.
+
+        Only orders that *reduce* an existing holding pass: a BUY always
+        adds exposure, and so does a SELL with nothing held (a short entry —
+        the live path would send it to the broker as an MIS short) or a SELL
+        larger than the holding (flips to short). Genuine exits pass.
+        """
+        if not self._entry_holds:
+            return None
+        reason = f"New entries closed for today ({self._entries_closed_reason})"
+
+        if order.transaction_type == TransactionType.BUY:
+            return self._reject(order, reason)
+
+        held = sum(p.quantity for p in positions if p.symbol == order.symbol)
+        if held <= 0:
+            return self._reject(
+                order, f"{reason}: SELL with no open position in {order.symbol} would open a short"
+            )
+        if order.quantity > held:
+            return self._reject(
+                order,
+                f"{reason}: SELL {order.quantity} exceeds held {held} in {order.symbol} "
+                f"— would flip to short",
+            )
+        return None
+
     def _check_position_limits(
         self,
         order: OrderRequest,
@@ -278,15 +327,23 @@ class RiskManager:
             )
         return None
 
-    def _get_max_trade_value(self, positions: list[Position]) -> float:
-        """Calculate the maximum value available for a new trade."""
+    def _get_max_trade_value(self, positions: list[Position], reducing: bool = False) -> float:
+        """
+        Calculate the maximum value available for a new trade.
+
+        `reducing`: the order exits exposure (a SELL of a holding) and does
+        not draw on the undeployed balance, so only the per-trade and
+        order-value caps apply.
+        """
+        # Per-trade cap
+        per_trade_max = self._config.total_capital * (self._config.max_capital_per_trade_pct / 100)
+        if reducing:
+            return min(per_trade_max, self._config.max_order_value)
+
         # Total deployed capital
         deployed = sum(p.invested_value for p in positions)
         max_deployed = self._config.total_capital * (self._config.max_capital_deployed_pct / 100)
         available = max_deployed - deployed
-
-        # Per-trade cap
-        per_trade_max = self._config.total_capital * (self._config.max_capital_per_trade_pct / 100)
 
         # Order value cap
         return min(available, per_trade_max, self._config.max_order_value)
@@ -398,12 +455,97 @@ class RiskManager:
         self._daily_realized_pnl += pnl
         self._daily_trades += 1
 
+    def close_new_entries(self, reason: str, key: str = "square_off") -> None:
+        """
+        Place an entry hold: orders that add exposure are rejected until
+        the hold is released or the next trading day's reset_daily().
+
+        Keys: "square_off" (intraday square-off), "after_close" (process
+        started after close), "data_unverified" (backfill failed — trading
+        data not verified). Exits remain allowed.
+        """
+        self._entry_holds[key] = (reason, datetime.now(IST).date())
+        logger.warning(f"🔒 New entries closed for today [{key}]: {reason}")
+        if self._audit:
+            self._audit.log(
+                AuditEventType.RISK_LIMIT_HIT,
+                {"action": "entries_closed", "key": key, "reason": reason},
+            )
+
+    def release_entry_hold(self, key: str) -> bool:
+        """Release one hold (e.g. data verified by a later warm-up). Other holds stay."""
+        if key not in self._entry_holds:
+            return False
+        reason, _day = self._entry_holds.pop(key)
+        logger.info(f"🔓 Entry hold released [{key}]: {reason}")
+        return True
+
+    @property
+    def entries_closed(self) -> bool:
+        return bool(self._entry_holds)
+
+    def entry_gate(self, order: OrderRequest, positions: list[Position]) -> RiskDecision | None:
+        """
+        Re-run only the entry-hold gate (no sizing, no limits). Used by the
+        order manager immediately before placement: an order approved just
+        before square-off must not reach the broker after entries closed.
+        """
+        return self._check_entries_closed(order, positions)
+
+    def entry_limits(
+        self, order: OrderRequest, positions: list[Position], sector: str = ""
+    ) -> RiskDecision | None:
+        """
+        Position-count and capital-availability gates for an already-sized
+        BUY, judged against the given position book. No sizing, no daily
+        trade counter.
+
+        Used by the order manager to judge the live leg of a BUY against the
+        positions verified at the broker, separately from the paper book the
+        order was sized from: a stock the broker already holds must not get a
+        second position, and capital the broker already has deployed must not
+        be allocated again.
+        """
+        if order.transaction_type != TransactionType.BUY:
+            return None
+        rejection = self._check_position_limits(order, positions, sector)
+        if rejection:
+            return rejection
+        max_value = self._get_max_trade_value(positions)
+        if max_value <= 0:
+            return self._reject(order, "Capital fully deployed — no allocation available")
+        if order.estimated_value > max_value:
+            return self._reject(
+                order,
+                f"Order value ₹{order.estimated_value:,.0f} exceeds available allocation "
+                f"₹{max_value:,.0f} given positions already held",
+            )
+        return None
+
+    @property
+    def _entries_closed_reason(self) -> str | None:
+        if not self._entry_holds:
+            return None
+        return "; ".join(reason for reason, _day in self._entry_holds.values())
+
     def reset_daily(self) -> None:
         """Reset daily counters for a new trading day."""
         self._daily_realized_pnl = 0.0
         self._daily_unrealized_pnl = 0.0
         self._daily_trades = 0
         self._trade_date = datetime.now(IST)
+        # Entry holds are scoped to the trading day they were placed on. A
+        # same-day reset (pre-market replayed after a restart) must not
+        # reopen entries that square-off already closed.
+        today = self._trade_date.date()
+        stale = [key for key, (_reason, day) in self._entry_holds.items() if day != today]
+        for key in stale:
+            del self._entry_holds[key]
+        if self._entry_holds:
+            logger.warning(
+                f"Risk manager daily reset: keeping entries closed for today "
+                f"({self._entries_closed_reason})"
+            )
         logger.info("Risk manager daily counters reset")
 
     def update_config(self, config: RiskConfig) -> None:

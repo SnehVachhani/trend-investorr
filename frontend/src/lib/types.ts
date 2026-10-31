@@ -8,6 +8,8 @@ export interface Stock {
   symbol: string;
   token: string;
   name: string;
+  company_name?: string | null;
+  sector?: string | null;
   exchange: string;
   series: string;
   sector_id: number | null;
@@ -20,6 +22,28 @@ export interface Stock {
   last_price?: number | null;
   price_date?: string | null;
   ath_price?: number | null;
+}
+
+/** Minimal stock data accepted by the shared stock-details modal. */
+export interface StockModalData {
+  symbol: string;
+  stock_id?: number;
+  exchange?: string;
+  name?: string | null;
+  company_name?: string | null;
+  stock_name?: string | null;
+  sector?: string | null;
+  industry?: string | null;
+  as_of_date?: string | null;
+  close?: number | null;
+  market_cap_cr?: number | null;
+  return_20d?: number | null;
+  market_relative_60d?: number | null;
+  enhanced_score?: number | null;
+  breakout_20?: boolean;
+  breakout_55?: boolean;
+  at_all_time_high?: boolean;
+  trend_aligned?: boolean;
 }
 
 export interface StockDetail extends Stock {
@@ -80,6 +104,8 @@ export interface Signal {
   id: number;
   symbol: string;
   name: string;
+  company_name?: string;
+  sector?: string | null;
   signal_type: string;
   strength: string;
   score: number;
@@ -96,6 +122,8 @@ export interface ScannerSignal {
   id: number;
   symbol: string;
   name: string;
+  company_name?: string;
+  sector?: string | null;
   scanner_name: string;
   pattern: string;
   direction: string;
@@ -112,6 +140,8 @@ export interface Order {
   id: number;
   symbol: string;
   name: string;
+  company_name?: string;
+  sector?: string | null;
   order_type: string;
   product_type: string;
   transaction_type: string;
@@ -130,6 +160,8 @@ export interface Position {
   id: number;
   symbol: string;
   name: string;
+  company_name?: string;
+  sector?: string | null;
   token: string;
   quantity: number;
   avg_buy_price: number;
@@ -220,6 +252,8 @@ export interface BacktestRun {
   algorithm_name: string;
   stock_symbol: string;
   stock_name: string;
+  company_name?: string;
+  sector?: string | null;
   start_date: string;
   end_date: string;
   initial_capital: number;
@@ -237,11 +271,34 @@ export interface BacktestRun {
   profit_factor: number | null;
   avg_hold_days: number | null;
   final_capital: number | null;
+  total_charges?: number | null;
   equity_curve: EquityPoint[];
   config: Record<string, unknown>;
   error_message: string;
   created_at: string;
   trades?: BacktestTrade[];
+}
+
+export type BacktestSection = 'algorithms' | 'filters' | 'watchlist';
+
+export interface BacktestHistoryItem {
+  id: number;
+  backtest_type: 'algorithm' | 'filter';
+  display_name: string;
+  stock_symbol: string;
+  stock_name: string;
+  company_name?: string;
+  sector?: string | null;
+  start_date: string;
+  end_date: string;
+  initial_capital: number;
+  status: string;
+  total_return_pct: number | null;
+  max_drawdown_pct: number | null;
+  sharpe_ratio: number | null;
+  win_rate_pct: number | null;
+  total_trades: number | null;
+  created_at: string;
 }
 
 export interface BacktestTrade {
@@ -272,4 +329,3 @@ export interface BacktestParams {
   end_date?: string;
   initial_capital?: number;
 }
-

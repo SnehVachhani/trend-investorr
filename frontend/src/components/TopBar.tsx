@@ -1,12 +1,13 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
 import { searchStocks } from '@/lib/api';
 import type { Stock } from '@/lib/types';
+import { formatStockSymbol, getStockCompanyName } from '@/lib/stock-display';
+import { useStockDetails } from './StockDetailsContext';
 
 export default function TopBar() {
-  const router = useRouter();
+  const { openStock } = useStockDetails();
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Stock[]>([]);
   const [isOpen, setIsOpen] = useState(false);
@@ -86,17 +87,26 @@ export default function TopBar() {
       setFocusedIdx((prev) => Math.max(prev - 1, 0));
     } else if (e.key === 'Enter' && focusedIdx >= 0) {
       e.preventDefault();
-      navigateTo(results[focusedIdx].symbol);
+      openStockResult(results[focusedIdx]);
     } else if (e.key === 'Escape') {
       setIsOpen(false);
       inputRef.current?.blur();
     }
   };
 
-  const navigateTo = (symbol: string) => {
+  const openStockResult = (stock: Stock) => {
     setQuery('');
     setIsOpen(false);
-    router.push(`/stocks/${symbol}`);
+    openStock({
+      symbol: stock.symbol,
+      name: stock.name,
+      company_name: stock.company_name,
+      sector: stock.sector,
+      industry: stock.industry,
+      market_cap_cr: stock.market_cap_cr,
+      close: stock.latest_price ?? stock.last_price ?? null,
+      as_of_date: stock.price_date ?? null,
+    });
   };
 
   // Global keyboard shortcut
@@ -144,22 +154,28 @@ export default function TopBar() {
         <span className="search-kbd">Ctrl+K</span>
 
         {isOpen && results.length > 0 && (
-          <div className="search-results">
+          <div className="search-results" role="listbox" aria-label="Stock search results">
             {results.map((stock, idx) => {
-              const displaySymbol = stock.symbol.replace(/-EQ$/, '');
+              const displaySymbol = formatStockSymbol(stock.symbol);
+              const companyName = getStockCompanyName(stock);
               return (
-              <div
+              <button
+                type="button"
                 key={stock.id}
                 className={`search-result-item ${idx === focusedIdx ? 'focused' : ''}`}
-                onClick={() => navigateTo(displaySymbol)}
+                role="option"
+                aria-selected={idx === focusedIdx}
+                onClick={() => openStockResult(stock)}
                 onMouseEnter={() => setFocusedIdx(idx)}
+                onFocus={() => setFocusedIdx(idx)}
               >
                 <div style={{ display: 'flex', alignItems: 'center' }}>
                   <span className="search-result-symbol">{displaySymbol}</span>
-                  <span className="search-result-name">{stock.name}</span>
+                  {companyName && <span className="search-result-name">{companyName}</span>}
+                  <span className="search-result-sector">Sector: {stock.sector || '—'}</span>
                 </div>
                 <span className="search-result-exchange">{stock.exchange}</span>
-              </div>
+              </button>
               );
             })}
           </div>

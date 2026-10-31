@@ -1,0 +1,6 @@
+{
+  "squareoff_settled_while_buy_in_flight": false,
+  "confirmation_flat_while_buy_in_flight": false,
+  "unreconciled_entries": 1,
+  "later_buy_status": "PLACED"
+}

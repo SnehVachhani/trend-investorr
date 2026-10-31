@@ -1,0 +1,41 @@
+[
+  {
+    "label": "candle starter",
+    "archive": "/Users/macbookpro/Documents/Codex/AlgoAnalyst-Taiga-Staging.zip",
+    "files": 159,
+    "root": [
+      "AlgoAnalyst-Taiga-Staging"
+    ],
+    "has_gitignore": true,
+    "has_runtime_requirements": true,
+    "has_dev_requirements": true,
+    "has_scheduler": true,
+    "git_or_agent_files": []
+  },
+  {
+    "label": "restart starter",
+    "archive": "/Users/macbookpro/Documents/Codex/AlgoAnalyst-Restart-Staging.zip",
+    "files": 159,
+    "root": [
+      "AlgoAnalyst-Restart-Staging"
+    ],
+    "has_gitignore": true,
+    "has_runtime_requirements": true,
+    "has_dev_requirements": true,
+    "has_scheduler": true,
+    "git_or_agent_files": []
+  },
+  {
+    "label": "square-off starter",
+    "archive": "/Users/macbookpro/Downloads/AlgoAnalyst-Live-Squareoff-Starter.zip",
+    "files": 162,
+    "root": [
+      "AlgoAnalyst-Live-Squareoff-Starter"
+    ],
+    "has_gitignore": true,
+    "has_runtime_requirements": true,
+    "has_dev_requirements": true,
+    "has_scheduler": true,
+    "git_or_agent_files": []
+  }
+]

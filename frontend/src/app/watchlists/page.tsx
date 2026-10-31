@@ -6,6 +6,7 @@ import {
   getWatchlists,
   getWatchlistStocks,
   createWatchlist,
+  renameWatchlist,
   deleteWatchlist,
   addStockToWatchlist,
   removeStockFromWatchlist,
@@ -17,6 +18,7 @@ import {
 } from '@/lib/api';
 import type { LivePrice, StockChange } from '@/lib/api';
 import type { Watchlist, Stock } from '@/lib/types';
+import StockIdentity from '@/components/StockIdentity';
 
 // ── Debounce utility ────────────────────────────────────────
 function useDebounce(value: string, delay: number) {
@@ -307,8 +309,8 @@ function AddStockPanel({
             return (
               <div key={stock.id} className="wl-add-stock-item">
                 <div className="wl-add-stock-info">
-                  <span className="wl-add-stock-sym">{stock.symbol.replace(/-EQ$/, '')}</span>
-                  <span className="wl-add-stock-name">{stock.name}</span>
+                  <StockIdentity symbol={stock.symbol} name={stock.name} company_name={stock.company_name} />
+                  <small style={{ display: 'block', marginTop: 3, color: 'var(--text-tertiary)' }}>Sector: {stock.sector || '—'}</small>
                 </div>
                 {alreadyAdded ? (
                   <span className="wl-added-badge">Added</span>
@@ -427,6 +429,7 @@ function ChangesModal({
                 <thead>
                   <tr>
                     <th className="changes-th-name">Stock</th>
+                    <th>Sector</th>
                     <th className="changes-th-price">Close</th>
                     {CHANGE_PERIODS.map((p) => (
                       <th
@@ -451,8 +454,9 @@ function ChangesModal({
                   {sorted.map((s) => (
                     <tr key={s.stock_id}>
                       <td className="changes-td-name">
-                        {s.name || s.symbol.replace(/-EQ$|-SM$|-BE$|-BZ$|-ST$/, '')}
+                        <StockIdentity symbol={s.symbol} name={s.name} company_name={s.company_name} />
                       </td>
+                      <td>{s.sector || '—'}</td>
                       <td className="changes-td-price">
                         {s.close ? `₹${s.close.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '-'}
                       </td>
@@ -496,6 +500,9 @@ export default function WatchlistsPage() {
   const [removingStockId, setRemovingStockId] = useState<number | null>(null);
   const [populating, setPopulating] = useState(false);
   const [editMode, setEditMode] = useState(false);
+  const [editingName, setEditingName] = useState('');
+  const [savingName, setSavingName] = useState(false);
+  const [nameError, setNameError] = useState('');
   const [reordering, setReordering] = useState(false);
   const [showChanges, setShowChanges] = useState(false);
 
@@ -655,6 +662,38 @@ export default function WatchlistsPage() {
   const selectedWl = watchlists.find((wl) => wl.id === selectedId) ?? null;
   const existingStockIds = new Set(stocks.map((s) => s.id));
 
+  useEffect(() => {
+    setEditingName(selectedWl?.name ?? '');
+    setNameError('');
+  }, [selectedId, selectedWl?.name]);
+
+  const handleRenameWatchlist = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedWl) return;
+
+    const trimmed = editingName.trim();
+    if (!trimmed) {
+      setNameError('Watchlist name is required');
+      return;
+    }
+    if (trimmed === selectedWl.name) return;
+
+    setSavingName(true);
+    setNameError('');
+    try {
+      const updated = await renameWatchlist(selectedWl.id, trimmed);
+      setWatchlists((current) =>
+        current
+          .map((wl) => wl.id === updated.id ? { ...wl, name: updated.name } : wl)
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    } catch (err: unknown) {
+      setNameError(err instanceof Error ? err.message : 'Failed to rename watchlist');
+    } finally {
+      setSavingName(false);
+    }
+  };
+
   // ── Loading state ─────────────────────────────────────
   if (loading) {
     return (
@@ -751,7 +790,32 @@ export default function WatchlistsPage() {
               {/* ── Watchlist Header ── */}
               <div className="wl-main-header">
                 <div>
-                  <h2 className="wl-main-title">{selectedWl.name}</h2>
+                  {editMode ? (
+                    <form className="wl-name-form" onSubmit={handleRenameWatchlist}>
+                      <input
+                        id="wl-edit-name"
+                        className="wl-name-input"
+                        aria-label="Watchlist name"
+                        value={editingName}
+                        onChange={(e) => {
+                          setEditingName(e.target.value);
+                          setNameError('');
+                        }}
+                        maxLength={64}
+                        aria-invalid={Boolean(nameError)}
+                      />
+                      <button
+                        type="submit"
+                        className="wl-name-save-btn"
+                        disabled={savingName || !editingName.trim() || editingName.trim() === selectedWl.name}
+                      >
+                        {savingName ? 'Saving…' : 'Save name'}
+                      </button>
+                    </form>
+                  ) : (
+                    <h2 className="wl-main-title">{selectedWl.name}</h2>
+                  )}
+                  {nameError && <p className="wl-name-error" role="alert">{nameError}</p>}
                   {selectedWl.description && (
                     <p className="wl-main-desc">{selectedWl.description}</p>
                   )}
@@ -777,7 +841,14 @@ export default function WatchlistsPage() {
                   )}
                   <button
                     className={`wl-edit-toggle ${editMode ? 'active' : ''}`}
-                    onClick={() => { setEditMode(!editMode); setShowAddStock(false); }}
+                    onClick={() => {
+                      if (!editMode && selectedWl) {
+                        setEditingName(selectedWl.name);
+                        setNameError('');
+                      }
+                      setEditMode(!editMode);
+                      setShowAddStock(false);
+                    }}
                     id="wl-edit-toggle"
                   >
                     {editMode ? (
@@ -857,6 +928,7 @@ export default function WatchlistsPage() {
                         <tr>
                           {editMode && <th style={{ width: 60 }}>Order</th>}
                           <th>Name</th>
+                          <th>Sector</th>
                           <th style={{ textAlign: 'right' }}>Mkt price / 1D</th>
                           <th style={{ textAlign: 'right' }}>Down from ATH</th>
                           {editMode && <th style={{ width: 48 }}></th>}
@@ -903,10 +975,9 @@ export default function WatchlistsPage() {
                                 style={{ cursor: 'pointer' }}
                                 onClick={() => router.push(`/stocks/${s.symbol}`)}
                               >
-                                <div style={{ fontWeight: 600, fontSize: 14 }}>
-                                  {s.name || s.symbol.replace(/-EQ$|-SM$/, '')}
-                                </div>
+                                <StockIdentity symbol={s.symbol} name={s.name} company_name={s.company_name} />
                               </td>
+                              <td>{s.sector || '—'}</td>
                               <td style={{ textAlign: 'right', minWidth: 130 }}>
                                 <div style={{
                                   fontFamily: "'JetBrains Mono', monospace",

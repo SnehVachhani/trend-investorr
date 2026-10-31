@@ -21,14 +21,63 @@ The live tick handler NEVER touches HistoricalFetcher or makes API calls.
 from __future__ import annotations
 
 import time
-from datetime import datetime, date, timedelta
-from typing import Any
+from datetime import datetime, date, timedelta, time as dt_time
+from typing import Any, Sequence
 
 from loguru import logger
 
-from core.constants import CandleInterval, BACKFILL_DAYS, IST
+from core.constants import (
+    BACKFILL_DAYS,
+    CandleInterval,
+    Exchange,
+    IST,
+    MARKET_OPEN,
+    MARKET_CLOSE,
+    NSE_HOLIDAYS_2026,
+)
 from core.exceptions import DataFetchError
 from data.models.market_data import Candle
+
+
+_STOCK_EXCHANGES = (Exchange.NSE.value, Exchange.BSE.value)
+
+
+def _normalise_stock_exchanges(
+    exchanges: str | Exchange | Sequence[str | Exchange],
+) -> tuple[str, ...]:
+    """Resolve the supported equity exchanges in stable priority order."""
+    if isinstance(exchanges, (str, Exchange)):
+        values = [exchanges]
+    else:
+        values = list(exchanges)
+
+    resolved: list[str] = []
+    for value in values:
+        name = value.value if isinstance(value, Exchange) else str(value)
+        name = name.strip().upper()
+        if name in {"ALL", "*"}:
+            for supported in _STOCK_EXCHANGES:
+                if supported not in resolved:
+                    resolved.append(supported)
+        elif name in _STOCK_EXCHANGES:
+            if name not in resolved:
+                resolved.append(name)
+        else:
+            raise ValueError(f"Unsupported stock exchange for candle sync: {name}")
+
+    if not resolved:
+        raise ValueError("At least one stock exchange is required for candle sync")
+    return tuple(resolved)
+
+
+def _combine_exchange_stats(by_exchange: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Keep per-exchange detail and expose summed counters at interval level."""
+    totals: dict[str, int | float] = {}
+    for stats in by_exchange.values():
+        for key, value in stats.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[key] = totals.get(key, 0) + value
+    return {**totals, "by_exchange": by_exchange}
 
 
 class DataIngestionService:
@@ -77,6 +126,57 @@ class DataIngestionService:
 
     # ── Backfill (One-Time) ──────────────────────────────
 
+    @classmethod
+    def _freshness_cutoff(
+        cls,
+        now: datetime,
+        interval: CandleInterval = CandleInterval.ONE_DAY,
+    ) -> datetime:
+        """Return the last expected candle timestamp for a completed session.
+
+        A date-only cutoff incorrectly marked an intraday series fresh as soon
+        as it had any candle on the latest trading date. For intraday intervals
+        require the final full bar of that session; daily candles are stamped
+        at midnight or the close, so the trading date is sufficient.
+        """
+        candidate = now.date()
+        if now.timetz().replace(tzinfo=None) < MARKET_CLOSE:
+            candidate -= timedelta(days=1)
+
+        holidays = set(NSE_HOLIDAYS_2026)
+        while candidate.weekday() >= 5 or candidate.isoformat() in holidays:
+            candidate -= timedelta(days=1)
+
+        if interval == CandleInterval.ONE_DAY:
+            expected_time = dt_time.min
+        else:
+            expected_time = cls._final_session_bar_time(interval)
+        return datetime.combine(candidate, expected_time, tzinfo=IST)
+
+    @classmethod
+    def _session_lookback_start(cls, now: datetime, lookback_sessions: int) -> datetime:
+        """Start at midnight of the earliest completed session in the window."""
+        candidate = cls._freshness_cutoff(now, CandleInterval.ONE_DAY).date()
+        holidays = set(NSE_HOLIDAYS_2026)
+        for _ in range(max(1, lookback_sessions) - 1):
+            candidate -= timedelta(days=1)
+            while candidate.weekday() >= 5 or candidate.isoformat() in holidays:
+                candidate -= timedelta(days=1)
+        return datetime.combine(candidate, dt_time.min, tzinfo=IST)
+
+    @staticmethod
+    def _final_session_bar_time(interval: CandleInterval) -> dt_time:
+        """Return the final timestamp used by SmartAPI for an NSE session."""
+        # The provider stamps its last hourly NSE candle at 15:15. The final
+        # hourly bar is shortened to the exchange close rather than stamped
+        # at 14:30; stored provider timestamps confirm this convention.
+        if interval == CandleInterval.ONE_HOUR:
+            return dt_time(15, 15)
+        return (
+            datetime.combine(date.min, MARKET_CLOSE)
+            - DataIngestionService._interval_step(interval)
+        ).time()
+
     def backfill(
         self,
         days: int = 90,
@@ -84,6 +184,8 @@ class DataIngestionService:
         exchange: str = "NSE",
         batch_pause: float = 0.1,
         max_workers: int = 5,
+        max_stock_retries: int = 3,
+        aggregate_daily: bool = True,
     ) -> dict[str, int]:
         """
         Smart backfill with concurrent fetching (max_workers threads).
@@ -97,11 +199,15 @@ class DataIngestionService:
             exchange: Stock exchange filter.
             batch_pause: Seconds to wait between stocks (courtesy delay).
             max_workers: Max concurrent API requests (default 5).
+            max_stock_retries: Additional whole-stock retry rounds after a
+                range fetch fails.
+            aggregate_daily: Rebuild daily candles after this standalone
+                backfill. Full multi-interval syncs disable this because the
+                same aggregation would otherwise run repeatedly.
 
         Returns:
-            Stats dict: {stocks_processed, candles_stored, skipped, errors}.
+            Stats dict with fetched, skipped, no-data, retry, and error counts.
         """
-        import threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
         stocks = self._stock_store.get_all_active(exchange=exchange)
         logger.info(
@@ -109,58 +215,155 @@ class DataIngestionService:
             f"{interval.value}, {max_workers} workers"
         )
 
-        stats = {"stocks_processed": 0, "candles_stored": 0, "skipped": 0, "errors": 0}
-        stats_lock = threading.Lock()
+        stats = {
+            "stocks_processed": 0,
+            "candles_stored": 0,
+            "skipped": 0,
+            "no_data": 0,
+            "retry_attempts": 0,
+            "errors": 0,
+        }
         processed_count = [0]  # mutable counter for progress logging
 
         now = datetime.now(IST)
         cutoff = now - timedelta(days=days)
 
-        # Determine freshness cutoff:
-        # Before market open (9:15 AM) → yesterday's data is the freshest available
-        # After market open → need today's data
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        market_open_today = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        # Use the last completed exchange trading date. This prevents a
+        # weekend/holiday from being treated as a missing candle date.
+        freshness_cutoff = self._freshness_cutoff(now, interval)
 
-        if now < market_open_today:
-            # Pre-market: previous trading day's data is still fresh
-            freshness_cutoff = today_start - timedelta(days=1)
-            # Handle weekends: Mon pre-market → Friday's data is fresh
-            while freshness_cutoff.weekday() >= 5:  # Sat=5, Sun=6
-                freshness_cutoff -= timedelta(days=1)
-        else:
-            # During/after market: need today's data
-            freshness_cutoff = today_start
+        interval_step = self._interval_step(interval)
+        api_exchange = Exchange(exchange) if isinstance(exchange, str) else exchange
+        full_history_request = (
+            interval == CandleInterval.ONE_DAY
+            and days >= BACKFILL_DAYS[CandleInterval.ONE_DAY]
+        )
 
-        def _process_stock(stock: dict) -> None:
-            """Fetch and store candles for a single stock (runs in thread)."""
+        def _missing_ranges(
+            existing: dict | None,
+        ) -> list[tuple[datetime, datetime, bool]]:
+            """Return only uncovered older/newer ranges.
+
+            The coverage table already tells us the boundaries of data in the
+            candle table.  Do not request the whole policy window when only
+            the older edge or the latest edge is missing.
+
+            The final boolean identifies a range that checks the oldest
+            boundary.  A successful empty result for that range proves a
+            newer listing has no older candles and can be marked complete.
+            """
+            if not existing:
+                return [(cutoff, now, True)]
+
+            earliest = existing.get("earliest_ts")
+            latest = existing.get("latest_ts")
+            if not earliest or not latest:
+                return [(cutoff, now, True)]
+
+            ranges: list[tuple[datetime, datetime, bool]] = []
+
+            if earliest > cutoff:
+                older_end = earliest - interval_step
+                if cutoff < older_end:
+                    ranges.append((cutoff, older_end, True))
+
+            if latest < freshness_cutoff:
+                newer_start = max(latest + interval_step, cutoff)
+                if newer_start < now:
+                    ranges.append((newer_start, now, False))
+
+            return ranges
+
+        def _fetch_range(
+            stock: dict,
+            range_start: datetime,
+            range_end: datetime,
+        ) -> list[Candle]:
+            """Fetch an exact missing range, with a test-friendly fallback."""
+            range_fetcher = getattr(self._fetcher, "get_candles_range", None)
+            if range_fetcher:
+                return range_fetcher(
+                    symbol=stock["symbol"],
+                    token=stock["token"],
+                    start=range_start,
+                    end=range_end,
+                    interval=interval,
+                    exchange=api_exchange,
+                )
+
+            # Lightweight fakes and older fetcher adapters may only expose
+            # get_candles(). Preserve compatibility while still limiting the
+            # requested window to the missing range.
+            requested_days = max(1, (range_end - range_start).days + 1)
+            return self._fetcher.get_candles(
+                symbol=stock["symbol"],
+                token=stock["token"],
+                days=requested_days,
+                interval=interval,
+                exchange=exchange,
+            )
+
+        def _process_stock(stock: dict) -> tuple[str, int, str]:
+            """Fetch only missing ranges for one stock."""
             try:
                 # ── Check existing coverage ──
+                existing = None
                 if self._coverage:
                     existing = self._coverage.get(stock["id"], interval.value)
                     if existing and existing.get("earliest_ts") and existing.get("latest_ts"):
                         earliest = existing["earliest_ts"]
                         latest = existing["latest_ts"]
-                        has_enough_history = earliest <= cutoff
+                        # A successful full-lifetime request can prove that a
+                        # newer listing has no older candles. Do not fetch it
+                        # on every startup just because it is less than 7300
+                        # days old.
+                        has_enough_history = bool(existing.get("history_complete")) or earliest <= cutoff
                         is_fresh = latest >= freshness_cutoff
-                        # Also verify actual candle count is reasonable
-                        actual_count = existing.get("candle_count", 0)
-                        expected_min = self._min_expected_candles(interval, days)
-                        has_enough_candles = actual_count >= expected_min
-                        if has_enough_history and is_fresh and has_enough_candles:
-                            with stats_lock:
-                                stats["skipped"] += 1
-                            return
+                        if has_enough_history and is_fresh:
+                            return "skipped", 0, ""
 
-                # ── Fetch from API ──
-                candles = self._fetcher.get_candles(
-                    symbol=stock["symbol"],
-                    token=stock["token"],
-                    days=days,
-                    interval=interval,
-                )
+                    # A valid empty response means the requested window was
+                    # checked successfully but contained no market candles
+                    # (weekend, exchange holiday, or an instrument with no
+                    # history). For a partial coverage row we must still
+                    # inspect the missing older boundary once; the previous
+                    # empty result might have been for the latest boundary.
+                    last_check = self._coverage.get_last_check(
+                        stock["id"], interval.value,
+                    )
+                    if (
+                        last_check
+                        and last_check.get("last_result") == "empty"
+                        and last_check.get("last_checked_at")
+                        and last_check["last_checked_at"] >= freshness_cutoff
+                        and (
+                            not existing
+                            or bool(existing.get("history_complete"))
+                        )
+                    ):
+                        return "no_data", 0, ""
 
-                if candles:
+                ranges = _missing_ranges(existing)
+                if not ranges:
+                    return "skipped", 0, ""
+
+                total_stored = 0
+                saw_data = False
+
+                # Store each range as it succeeds. If a later range fails,
+                # the retry pass sees the updated coverage and retries only
+                # the still-missing range.
+                for range_start, range_end, checks_oldest in ranges:
+                    candles = _fetch_range(stock, range_start, range_end)
+                    if not candles:
+                        if checks_oldest and self._coverage and existing:
+                            self._coverage.mark_history_complete(
+                                stock_id=stock["id"],
+                                interval=interval.value,
+                            )
+                        continue
+
+                    candles.sort(key=lambda candle: candle.timestamp)
                     if interval == CandleInterval.ONE_DAY:
                         # Daily table has extra columns: delivery_qty, delivery_pct
                         rows = [
@@ -193,6 +396,8 @@ class DataIngestionService:
                             for c in candles
                         ]
                     self._candle_store.insert_batch(interval, rows)
+                    total_stored += len(rows)
+                    saw_data = True
 
                     if self._coverage:
                         self._coverage.upsert(
@@ -202,45 +407,102 @@ class DataIngestionService:
                             latest=candles[-1].timestamp,
                             candle_count=len(candles),
                             source="angel_one",
+                            history_complete=(
+                                True if full_history_request and checks_oldest else None
+                            ),
                         )
 
-                    with stats_lock:
-                        stats["candles_stored"] += len(rows)
+                if self._coverage:
+                    self._coverage.record_check(
+                        stock_id=stock["id"],
+                        interval=interval.value,
+                        result="data" if saw_data else "empty",
+                    )
 
-                with stats_lock:
-                    stats["stocks_processed"] += 1
+                if not saw_data:
+                    return "no_data", 0, ""
+
+                time.sleep(batch_pause)
+                return "processed", total_stored, ""
+
+            except DataFetchError as e:
+                return "error", 0, str(e)
+            except Exception as e:
+                return "error", 0, str(e)
+
+        def _run_batch(batch: list[dict], final_round: bool) -> list[dict]:
+            """Run one concurrent batch and return only failed stocks."""
+            failed: list[dict] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_process_stock, stock): stock
+                    for stock in batch
+                }
+                for future in as_completed(futures):
+                    stock = futures[future]
+                    try:
+                        status, stored, error = future.result()
+                    except Exception as exc:  # defensive: worker should self-classify
+                        status, stored, error = "error", 0, str(exc)
+
+                    if status == "error":
+                        if final_round:
+                            stats["errors"] += 1
+                            processed_count[0] += 1
+                            if self._coverage:
+                                self._coverage.record_check(
+                                    stock_id=stock["id"],
+                                    interval=interval.value,
+                                    result="error",
+                                    error=error,
+                                )
+                            logger.error(
+                                f"Backfill permanently failed for {stock['symbol']} "
+                                f"after stock-level retries: {error}"
+                            )
+                        else:
+                            failed.append(stock)
+                        continue
+
+                    if status == "processed":
+                        stats["stocks_processed"] += 1
+                        stats["candles_stored"] += stored
+                    elif status == "skipped":
+                        stats["skipped"] += 1
+                    else:
+                        stats["no_data"] += 1
                     processed_count[0] += 1
-                    total_done = processed_count[0] + stats["skipped"]
+
+                    total_done = processed_count[0]
                     if total_done % 50 == 0:
                         logger.info(
                             f"Backfill progress: {total_done}/{len(stocks)} stocks | "
-                            f"{stats['candles_stored']:,} stored, {stats['skipped']} skipped"
+                            f"{stats['candles_stored']:,} stored, "
+                            f"{stats['skipped']} skipped, {stats['no_data']} no-data, "
+                            f"{len(failed)} retrying"
                         )
+            return failed
 
-                time.sleep(batch_pause)
+        pending = _run_batch(stocks, final_round=max_stock_retries == 0)
+        for retry_round in range(1, max_stock_retries + 1):
+            if not pending:
+                break
+            stats["retry_attempts"] += len(pending)
+            delay = min(60, 2 ** retry_round)
+            logger.warning(
+                f"Retrying {len(pending)} failed {interval.value} stocks "
+                f"in {delay}s (round {retry_round}/{max_stock_retries})"
+            )
+            time.sleep(delay)
+            pending = _run_batch(
+                pending,
+                final_round=retry_round == max_stock_retries,
+            )
 
-            except DataFetchError as e:
-                with stats_lock:
-                    stats["errors"] += 1
-                    processed_count[0] += 1
-                logger.warning(f"Backfill error for {stock['symbol']}: {e}")
-            except Exception as e:
-                with stats_lock:
-                    stats["errors"] += 1
-                    processed_count[0] += 1
-                logger.error(f"Unexpected backfill error for {stock['symbol']}: {e}")
-
-        # ── Run with thread pool (5 concurrent fetches) ──
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_process_stock, stock) for stock in stocks]
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Thread error in backfill: {e}")
-
-        # After backfill, aggregate into daily candles
-        if interval != CandleInterval.ONE_DAY:
+        # After a standalone backfill, aggregate into daily candles. The
+        # all-interval startup path disables this to avoid repeating hundreds
+        # of thousands of per-stock/day queries after every interval.
+        if interval != CandleInterval.ONE_DAY and aggregate_daily:
             logger.info("Backfill complete — aggregating daily candles...")
             self.aggregate_all_daily(
                 source_interval=interval, days=days, exchange=exchange,
@@ -249,16 +511,64 @@ class DataIngestionService:
         logger.info(
             f"Backfill finished: {stats['stocks_processed']} fetched, "
             f"{stats['skipped']} skipped, "
-            f"{stats['candles_stored']:,} candles, {stats['errors']} errors"
+            f"{stats['no_data']} no-data, {stats['candles_stored']:,} candles, "
+            f"{stats['errors']} errors, {stats['retry_attempts']} stock retries"
         )
         return stats
 
     # ── Incremental Update (Nightly) ─────────────────────
 
+    @staticmethod
+    def _interval_step(interval: CandleInterval) -> timedelta:
+        """Return the smallest timestamp step for an interval."""
+        return {
+            CandleInterval.ONE_MINUTE: timedelta(minutes=1),
+            CandleInterval.FIVE_MINUTE: timedelta(minutes=5),
+            CandleInterval.FIFTEEN_MINUTE: timedelta(minutes=15),
+            CandleInterval.ONE_HOUR: timedelta(hours=1),
+            CandleInterval.ONE_DAY: timedelta(days=1),
+            CandleInterval.ONE_WEEK: timedelta(days=7),
+        }.get(interval, timedelta(minutes=1))
+
+    @classmethod
+    def _get_incremental_start(
+        cls,
+        last_ts: datetime | None,
+        end: datetime,
+        interval: CandleInterval,
+        max_history_days: int | None = None,
+    ) -> datetime:
+        """Choose the first timestamp that can still contain pending candles."""
+        lookback_start = (
+            end - timedelta(days=max_history_days)
+            if max_history_days is not None
+            else None
+        )
+        if last_ts is None:
+            return lookback_start or end
+
+        next_candle = last_ts + cls._interval_step(interval)
+        if lookback_start is None:
+            return next_candle
+        return max(next_candle, lookback_start)
+
+    @classmethod
+    def _is_interval_current(
+        cls,
+        last_ts: datetime | None,
+        end: datetime,
+        interval: CandleInterval,
+    ) -> bool:
+        """Return whether an interval is complete after market close."""
+        if last_ts is None:
+            return False
+        return last_ts >= cls._freshness_cutoff(end, interval)
+
     def incremental_update(
         self,
         interval: CandleInterval = CandleInterval.FIVE_MINUTE,
         exchange: str = "NSE",
+        max_history_days: int | None = None,
     ) -> dict[str, int]:
         """
         Nightly incremental update: fetch today's intraday candles and append.
@@ -283,43 +593,74 @@ class DataIngestionService:
                     interval=interval,
                 )
 
-                # Default to today's market open if no data exists
-                if last_ts is None:
-                    last_ts = datetime.now(IST).replace(
-                        hour=9, minute=15, second=0, microsecond=0,
-                    )
-
                 end = datetime.now(IST)
 
-                # Skip if last_ts is already past market close today
-                market_close_today = end.replace(
-                    hour=15, minute=30, second=0, microsecond=0,
-                )
-                if last_ts >= market_close_today:
+                if self._is_interval_current(last_ts, end, interval):
                     continue
+
+                freshness_cutoff = self._freshness_cutoff(end, interval)
+                if self._coverage:
+                    last_check = self._coverage.get_last_check(
+                        stock["id"], interval.value,
+                    )
+                    if (
+                        last_check
+                        and last_check.get("last_result") == "empty"
+                        and last_check.get("last_checked_at")
+                        and last_check["last_checked_at"] >= freshness_cutoff
+                    ):
+                        continue
+
+                start = self._get_incremental_start(
+                    last_ts=last_ts,
+                    end=end,
+                    interval=interval,
+                    max_history_days=max_history_days,
+                )
 
                 candles = self._fetcher.get_candles_range(
                     symbol=stock["symbol"],
                     token=stock["token"],
-                    start=last_ts + timedelta(minutes=1),
+                    start=start,
                     end=end,
                     interval=interval,
+                    exchange=Exchange(exchange) if isinstance(exchange, str) else exchange,
                 )
 
                 if candles:
-                    rows = [
-                        (
-                            stock["id"],
-                            c.timestamp,
-                            c.open,
-                            c.high,
-                            c.low,
-                            c.close,
-                            c.volume,
-                            c.vwap,
-                        )
-                        for c in candles
-                    ]
+                    if interval == CandleInterval.ONE_DAY:
+                        # candles_1d includes delivery fields in addition to
+                        # the common OHLCV/VWAP columns. Keep incremental
+                        # inserts aligned with CandleStore.insert_batch().
+                        rows = [
+                            (
+                                stock["id"],
+                                c.timestamp,
+                                c.open,
+                                c.high,
+                                c.low,
+                                c.close,
+                                c.volume,
+                                c.vwap,
+                                getattr(c, "delivery_qty", 0) or 0,
+                                getattr(c, "delivery_pct", 0) or 0,
+                            )
+                            for c in candles
+                        ]
+                    else:
+                        rows = [
+                            (
+                                stock["id"],
+                                c.timestamp,
+                                c.open,
+                                c.high,
+                                c.low,
+                                c.close,
+                                c.volume,
+                                c.vwap,
+                            )
+                            for c in candles
+                        ]
                     self._candle_store.insert_batch(interval, rows)
                     stats["candles_added"] += len(rows)
                     stats["stocks_updated"] += 1
@@ -334,21 +675,121 @@ class DataIngestionService:
                             candle_count=len(candles),
                         )
 
+                if self._coverage:
+                    self._coverage.record_check(
+                        stock_id=stock["id"],
+                        interval=interval.value,
+                        result="data" if candles else "empty",
+                    )
+
                 # Rate limit safety
                 time.sleep(0.1)  # courtesy delay
 
             except DataFetchError as e:
                 stats["errors"] += 1
-                logger.debug(f"Incremental update error for {stock['symbol']}: {e}")
+                if self._coverage:
+                    self._coverage.record_check(
+                        stock_id=stock["id"],
+                        interval=interval.value,
+                        result="error",
+                        error=type(e).__name__,
+                    )
+                logger.debug(
+                    "Incremental update error for {} ({})",
+                    stock["symbol"],
+                    type(e).__name__,
+                )
             except Exception as e:
                 stats["errors"] += 1
-                logger.error(f"Unexpected incremental error for {stock['symbol']}: {e}")
+                if self._coverage:
+                    self._coverage.record_check(
+                        stock_id=stock["id"],
+                        interval=interval.value,
+                        result="error",
+                        error=type(e).__name__,
+                    )
+                logger.error(
+                    "Unexpected incremental error for {} ({})",
+                    stock["symbol"],
+                    type(e).__name__,
+                )
 
         logger.info(
             f"Incremental update finished: {stats['stocks_updated']} stocks, "
             f"{stats['candles_added']:,} candles, {stats['errors']} errors"
         )
         return stats
+
+    def sync_pending_all_intervals(
+        self,
+        exchange: str | Exchange | Sequence[str | Exchange] = "ALL",
+    ) -> dict[str, dict]:
+        """Fetch pending candles, finishing each exchange's 5m data first."""
+        exchanges = _normalise_stock_exchanges(exchange)
+        all_stats: dict[str, dict] = {}
+
+        # Keep the primary five-minute stream first in the scheduled catch-up
+        # too.  The insertion order of BACKFILL_DAYS is not an API guarantee,
+        # and a long one-minute sweep should not delay the bars used by the
+        # intraday backtests and volume-profile filters.
+        interval_order = (
+            CandleInterval.FIVE_MINUTE,
+            CandleInterval.ONE_MINUTE,
+            CandleInterval.FIFTEEN_MINUTE,
+            CandleInterval.ONE_HOUR,
+            CandleInterval.ONE_DAY,
+        )
+        for interval in interval_order:
+            days = BACKFILL_DAYS[interval]
+
+            logger.info(
+                f"Synchronizing pending {interval.value} candles "
+                f"(max lookback: {days} days)"
+            )
+            by_exchange: dict[str, dict[str, Any]] = {}
+            for exchange_name in exchanges:
+                stats = self.incremental_update(
+                    interval=interval,
+                    exchange=exchange_name,
+                    max_history_days=days,
+                )
+                if interval == CandleInterval.FIVE_MINUTE:
+                    stats.update(self.repair_recent_session_edge_gaps(
+                        interval=interval,
+                        exchange=exchange_name,
+                        lookback_days=2,
+                    ))
+                by_exchange[exchange_name] = stats
+            all_stats[interval.value] = _combine_exchange_stats(by_exchange)
+
+        # One-minute gaps can help reconstruct recent five-minute edges. Run
+        # this repair after both exchanges' primary 5m downloads and the 1m
+        # catch-up, while preserving the 5m-first priority for provider calls.
+        five_minute_by_exchange = all_stats[CandleInterval.FIVE_MINUTE.value]["by_exchange"]
+        for exchange_name in exchanges:
+            five_minute_by_exchange[exchange_name].update(
+                self.repair_recent_five_minute_edges_from_one_minute(
+                    exchange=exchange_name,
+                    lookback_days=2,
+                )
+            )
+        all_stats[CandleInterval.FIVE_MINUTE.value] = _combine_exchange_stats(
+            five_minute_by_exchange,
+        )
+
+        logger.info("Aggregating weekly candles from synchronized daily data...")
+        weekly_by_exchange = {
+            exchange_name: {
+                "candles_stored": self.aggregate_weekly(exchange=exchange_name),
+            }
+            for exchange_name in exchanges
+        }
+        all_stats[CandleInterval.ONE_WEEK.value] = {
+            **_combine_exchange_stats(weekly_by_exchange),
+            "source": "aggregated_from_daily",
+        }
+        logger.info("Pending candle synchronization complete for {}", ", ".join(exchanges))
+        return all_stats
 
     # ── Aggregation: Intraday → Daily (candles_5m → candles_1d) ──
 
@@ -421,6 +862,9 @@ class DataIngestionService:
                 source_interval=source_interval,
                 exchange=exchange,
             )
+        if self._coverage:
+            self._coverage.refresh_from_table(CandleInterval.ONE_DAY.value)
+
         logger.info(f"Full daily aggregation: {total} candles across {days} days")
         return total
 
@@ -433,60 +877,13 @@ class DataIngestionService:
 
         Returns number of weekly candles upserted.
         """
-        stocks = self._stock_store.get_all_active(exchange=exchange)
-        upserted = 0
+        upserted = self._candle_store.aggregate_weekly_from_daily(
+            days=730,
+            exchange=exchange,
+        )
 
-        for stock in stocks:
-            try:
-                # Get all daily candles for this stock
-                daily_rows = self._candle_store.get_candles(
-                    stock_id=stock["id"],
-                    interval=CandleInterval.ONE_DAY,
-                    days=730,  # All available data
-                )
-
-                if not daily_rows:
-                    continue
-
-                # Group by ISO week (year, week_number)
-                weeks: dict[tuple[int, int], list[dict]] = {}
-                for row in daily_rows:
-                    ts = row["timestamp"]
-                    iso_year, iso_week, _ = ts.isocalendar()
-                    key = (iso_year, iso_week)
-                    if key not in weeks:
-                        weeks[key] = []
-                    weeks[key].append(row)
-
-                # Build weekly candles
-                for (iso_year, iso_week), days_in_week in weeks.items():
-                    if not days_in_week:
-                        continue
-
-                    # Sort by timestamp
-                    days_in_week.sort(key=lambda r: r["timestamp"])
-
-                    # Weekly timestamp = Monday of that week
-                    monday = days_in_week[0]["timestamp"].date()
-                    monday -= timedelta(days=monday.weekday())  # Roll back to Monday
-                    week_ts = datetime.combine(
-                        monday, datetime.min.time(), tzinfo=IST,
-                    )
-
-                    self._candle_store.insert(
-                        stock_id=stock["id"],
-                        timestamp=week_ts,
-                        interval=CandleInterval.ONE_WEEK,
-                        open_=float(days_in_week[0]["open"]),
-                        high=float(max(d["high"] for d in days_in_week)),
-                        low=float(min(d["low"] for d in days_in_week)),
-                        close=float(days_in_week[-1]["close"]),
-                        volume=sum(int(d["volume"]) for d in days_in_week),
-                    )
-                    upserted += 1
-
-            except Exception as e:
-                logger.debug(f"Weekly aggregation error for {stock['symbol']}: {e}")
+        if self._coverage:
+            self._coverage.refresh_from_table(CandleInterval.ONE_WEEK.value)
 
         logger.info(f"Weekly aggregation: {upserted} candles upserted")
         return upserted
@@ -507,7 +904,9 @@ class DataIngestionService:
         for the next scheduled backfill cycle.
 
         Args:
-            stock: Stock dict with keys: id, symbol, token.
+            stock: Stock dict with keys: id, symbol, token, and optionally
+                exchange.  NSE remains the compatibility default for older
+                callers that do not supply an exchange.
             days: Number of days of history to fetch per interval.
             intervals: Which intervals to backfill. Defaults to all
                        API-fetchable intervals (1m, 5m, 15m, 1h, 1d).
@@ -523,6 +922,16 @@ class DataIngestionService:
                 CandleInterval.ONE_DAY,
             ]
 
+        exchange_name = str(stock.get("exchange", Exchange.NSE.value)).upper()
+        try:
+            exchange = Exchange(exchange_name)
+        except ValueError:
+            logger.warning(
+                f"Unknown exchange {exchange_name!r} for {stock['symbol']}; "
+                "using NSE for the on-demand backfill"
+            )
+            exchange = Exchange.NSE
+
         stats = {"candles_stored": 0, "intervals_done": 0, "errors": 0}
 
         for interval in intervals:
@@ -535,6 +944,7 @@ class DataIngestionService:
                     token=stock["token"],
                     days=fetch_days,
                     interval=interval,
+                    exchange=exchange,
                 )
 
                 if candles:
@@ -611,134 +1021,405 @@ class DataIngestionService:
 
     def backfill_all_intervals(
         self,
-        exchange: str = "NSE",
+        exchange: str | Exchange | Sequence[str | Exchange] = "ALL",
         batch_pause: float = 0.1,
     ) -> dict[str, dict]:
         """
         Run backfill for ALL intervals using the BACKFILL_DAYS policy.
 
         Fetches each interval with its configured history depth:
-            1m → 1 day, 5m → 90 days, 15m → 30 days,
-            1h → 90 days, 1d → 365 days, 1w → aggregated from 1d
+            1m → 7 days, 5m → 1095 days, 15m → 30 days,
+            1h → 90 days, 1d → lifetime window, 1w → aggregated from 1d
 
         Returns:
             Dict of {interval: stats_dict} for each interval processed.
         """
+        exchanges = _normalise_stock_exchanges(exchange)
         all_stats: dict[str, dict] = {}
 
-        # Fetch API-based intervals (1m and 5m ONLY, to save API limit)
-        for interval in [CandleInterval.ONE_MINUTE, CandleInterval.FIVE_MINUTE]:
+        # Repair the 5-minute series first because it feeds the intraday
+        # backtests and volume profile. Previously current 1-minute gaps could
+        # occupy most of the provider's rate-limited request window first.
+        interval_order = (
+            CandleInterval.FIVE_MINUTE,
+            CandleInterval.ONE_MINUTE,
+            CandleInterval.FIFTEEN_MINUTE,
+            CandleInterval.ONE_HOUR,
+            CandleInterval.ONE_DAY,
+        )
+        for interval in interval_order:
             days = BACKFILL_DAYS[interval]
-            logger.info(f"Backfilling {interval.value}: {days} days")
-            stats = self.backfill(
-                days=days,
-                interval=interval,
-                exchange=exchange,
-                batch_pause=batch_pause,
+
+            # Coverage metadata can predate the current candle tables (for
+            # example after an import or an older sync that wrote candles
+            # without updating candle_coverage).  Reconcile the boundaries
+            # from the actual table before deciding which ranges are missing.
+            # Without this, an existing multi-day history can look like a
+            # short history and cause the backfill to download it again.
+            if self._coverage:
+                logger.info(
+                    f"Reconciling {interval.value} coverage from stored candles"
+                )
+                self._coverage.refresh_from_table(interval.value)
+
+            logger.info(f"Backfilling {interval.value}: {days} days across {', '.join(exchanges)}")
+            by_exchange: dict[str, dict[str, Any]] = {}
+            for exchange_name in exchanges:
+                stats = self.backfill(
+                    days=days,
+                    interval=interval,
+                    exchange=exchange_name,
+                    batch_pause=batch_pause,
+                    aggregate_daily=False,
+                )
+                if interval == CandleInterval.FIVE_MINUTE:
+                    # Repair boundary holes before spending requests on lower
+                    # priority candle intervals.
+                    stats.update(self.repair_recent_session_edge_gaps(
+                        interval=interval,
+                        exchange=exchange_name,
+                        lookback_days=2,
+                    ))
+                by_exchange[exchange_name] = stats
+            all_stats[interval.value] = _combine_exchange_stats(by_exchange)
+
+        # A complete 1m pass may provide source bars for any remaining recent
+        # 5m gaps. This is a repair only; primary 5m fetching remains first.
+        five_minute_by_exchange = all_stats[CandleInterval.FIVE_MINUTE.value]["by_exchange"]
+        for exchange_name in exchanges:
+            five_minute_by_exchange[exchange_name].update(
+                self.repair_recent_five_minute_edges_from_one_minute(
+                    exchange=exchange_name,
+                    lookback_days=2,
+                )
             )
-            all_stats[interval.value] = stats
+        all_stats[CandleInterval.FIVE_MINUTE.value] = _combine_exchange_stats(
+            five_minute_by_exchange,
+        )
 
-        # Fast local SQL aggregation for 15m, 1h, 1d from the downloaded 5m data
-        logger.info("Running fast local SQL aggregation for 15m, 1h, 1d...")
-        self.aggregate_fast_local()
-        all_stats[CandleInterval.FIFTEEN_MINUTE.value] = {"source": "local_aggregate"}
-        all_stats[CandleInterval.ONE_HOUR.value] = {"source": "local_aggregate"}
-        all_stats[CandleInterval.ONE_DAY.value] = {"source": "local_aggregate"}
-
-        # Aggregate weekly candles from daily data
+        # Aggregate weekly candles from daily data for every listed venue.
         logger.info("Aggregating weekly candles from daily data...")
-        weekly_count = self.aggregate_weekly(exchange=exchange)
+        weekly_by_exchange = {
+            exchange_name: {
+                "candles_stored": self.aggregate_weekly(exchange=exchange_name),
+            }
+            for exchange_name in exchanges
+        }
         all_stats[CandleInterval.ONE_WEEK.value] = {
-            "candles_stored": weekly_count, "source": "aggregated_from_daily",
+            **_combine_exchange_stats(weekly_by_exchange),
+            "source": "aggregated_from_daily",
         }
 
-        logger.info(f"All-interval backfill complete: {list(all_stats.keys())}")
+        logger.info(
+            "All-interval backfill complete for {}: {}",
+            ", ".join(exchanges), list(all_stats.keys()),
+        )
         return all_stats
 
-    def aggregate_fast_local(self) -> None:
+    def repair_recent_session_edge_gaps(
+        self,
+        *,
+        interval: CandleInterval = CandleInterval.FIVE_MINUTE,
+        exchange: str = "NSE",
+        lookback_days: int = 60,
+        stock_ids: list[int] | None = None,
+        batch_pause: float = 0.05,
+    ) -> dict[str, int]:
+        """Re-fetch stored sessions missing the opening or final full candle.
+
+        Coverage min/max values cannot reveal a missing bar inside an otherwise
+        covered range. This targeted repair checks recent session boundaries,
+        fetches the whole affected session, and upserts it idempotently.
         """
-        Aggregates 15m, 1h, and 1d natively in SQL from 5m data.
-        Exponentially faster than making API requests.
+        stats = {
+            "edge_sessions_found": 0,
+            "edge_sessions_attempted": 0,
+            "edge_sessions_repaired": 0,
+            "edge_sessions_unresolved": 0,
+            "edge_missing_open": 0,
+            "edge_missing_close": 0,
+            "edge_candles_received": 0,
+            "edge_errors": 0,
+        }
+        if self._coverage is None:
+            logger.warning("Cannot repair session-edge gaps without candle coverage storage")
+            stats["edge_errors"] = 1
+            return stats
+
+        interval_value = interval.value
+        now = datetime.now(IST)
+        lookback_start = self._session_lookback_start(now, lookback_days)
+        gaps = self._coverage.find_recent_session_edge_gaps(
+            interval=interval_value,
+            start=lookback_start,
+            end=now,
+            exchange=exchange,
+            stock_ids=stock_ids,
+        )
+        stats["edge_sessions_found"] = len(gaps)
+        if not gaps:
+            return stats
+
+        expected_close_time = self._final_session_bar_time(interval)
+        touched_stock_ids: set[int] = set()
+        api_exchange = Exchange(exchange) if isinstance(exchange, str) else exchange
+
+        for gap in gaps:
+            stats["edge_sessions_attempted"] += 1
+            session_date = gap["session_date"]
+            session_start = datetime.combine(session_date, MARKET_OPEN, tzinfo=IST)
+            session_end = datetime.combine(session_date, MARKET_CLOSE, tzinfo=IST)
+            try:
+                candles = self._fetcher.get_candles_range(
+                    symbol=gap["symbol"],
+                    token=gap["token"],
+                    start=session_start,
+                    end=session_end,
+                    interval=interval,
+                    exchange=api_exchange,
+                )
+                candles.sort(key=lambda candle: candle.timestamp)
+                if candles:
+                    rows = [
+                        (
+                            gap["stock_id"],
+                            candle.timestamp,
+                            candle.open,
+                            candle.high,
+                            candle.low,
+                            candle.close,
+                            candle.volume,
+                            candle.vwap,
+                        )
+                        for candle in candles
+                    ]
+                    self._candle_store.insert_batch(interval, rows)
+                    touched_stock_ids.add(gap["stock_id"])
+                    stats["edge_candles_received"] += len(candles)
+
+                fetched_times = {
+                    candle.timestamp.astimezone(IST).time().replace(tzinfo=None)
+                    for candle in candles
+                }
+                has_open = bool(gap["has_open"]) or MARKET_OPEN in fetched_times
+                has_close = bool(gap["has_close"]) or expected_close_time in fetched_times
+                if not has_open:
+                    stats["edge_missing_open"] += 1
+                if not has_close:
+                    stats["edge_missing_close"] += 1
+                if has_open and has_close:
+                    stats["edge_sessions_repaired"] += 1
+                else:
+                    stats["edge_sessions_unresolved"] += 1
+                time.sleep(batch_pause)
+            except Exception as exc:
+                stats["edge_errors"] += 1
+                stats["edge_sessions_unresolved"] += 1
+                logger.warning(
+                    "Session-edge repair failed for {} on {} ({})",
+                    gap["symbol"],
+                    session_date,
+                    interval_value,
+                    type(exc).__name__,
+                )
+            if stats["edge_sessions_attempted"] % 25 == 0:
+                logger.info(
+                    "Session-edge repair {} progress: {}/{} sessions",
+                    interval_value,
+                    stats["edge_sessions_attempted"],
+                    stats["edge_sessions_found"],
+                )
+
+        for stock_id in touched_stock_ids:
+            self._coverage.refresh_stock_from_table(stock_id, interval_value)
+
+        logger.info(
+            "Session-edge repair {}: {}/{} repaired, {} unresolved, {} candles fetched, {} errors",
+            interval_value,
+            stats["edge_sessions_repaired"],
+            stats["edge_sessions_found"],
+            stats["edge_sessions_unresolved"],
+            stats["edge_candles_received"],
+            stats["edge_errors"],
+        )
+        return stats
+
+    def repair_recent_five_minute_edges_from_one_minute(
+        self,
+        *,
+        exchange: str = "NSE",
+        lookback_days: int = 2,
+        stock_ids: list[int] | None = None,
+        fetch_missing_groups: bool = False,
+    ) -> dict[str, int]:
+        """Rebuild absent 5-minute session edges from complete stored 1-minute bars.
+
+        A five-minute OHLCV bar is reconstructed only when all five underlying
+        one-minute bars are present. This provides an exact aggregation for
+        recent sessions where SmartAPI omitted the five-minute edge candle,
+        without filling gaps with estimated prices or volume.
         """
-        queries = {
-            "15m": """
-                INSERT INTO candles_15m (stock_id, timestamp, open, high, low, close, volume, vwap)
-                SELECT 
-                    stock_id,
-                    date_trunc('hour', timestamp) + floor(extract(minute FROM timestamp) / 15) * interval '15 min' AS agg_ts,
-                    (array_agg(open ORDER BY timestamp))[1],
-                    MAX(high),
-                    MIN(low),
-                    (array_agg(close ORDER BY timestamp DESC))[1],
-                    SUM(volume),
-                    COALESCE(SUM(vwap * volume) / NULLIF(SUM(volume), 0), 0)
-                FROM candles_5m
-                GROUP BY stock_id, agg_ts
-                ON CONFLICT (stock_id, timestamp) DO NOTHING;
-            """,
-            "1h": """
-                INSERT INTO candles_1h (stock_id, timestamp, open, high, low, close, volume, vwap)
-                SELECT 
-                    stock_id,
-                    date_trunc('hour', timestamp) AS agg_ts,
-                    (array_agg(open ORDER BY timestamp))[1],
-                    MAX(high),
-                    MIN(low),
-                    (array_agg(close ORDER BY timestamp DESC))[1],
-                    SUM(volume),
-                    COALESCE(SUM(vwap * volume) / NULLIF(SUM(volume), 0), 0)
-                FROM candles_5m
-                GROUP BY stock_id, agg_ts
-                ON CONFLICT (stock_id, timestamp) DO NOTHING;
-            """,
-            "1d": """
-                INSERT INTO candles_1d (stock_id, timestamp, open, high, low, close, volume, vwap, delivery_qty, delivery_pct)
-                SELECT 
-                    stock_id,
-                    date_trunc('day', timestamp) + interval '15 hours 30 minutes' AS agg_ts,
-                    (array_agg(open ORDER BY timestamp))[1],
-                    MAX(high),
-                    MIN(low),
-                    (array_agg(close ORDER BY timestamp DESC))[1],
-                    SUM(volume),
-                    COALESCE(SUM(vwap * volume) / NULLIF(SUM(volume), 0), 0),
-                    0,
-                    0
-                FROM candles_5m
-                GROUP BY stock_id, agg_ts
-                ON CONFLICT (stock_id, timestamp) DO NOTHING;
-            """
+        stats = {
+            "minute_edge_sessions_found": 0,
+            "minute_edge_groups_requested": 0,
+            "minute_edge_bars_rebuilt": 0,
+            "minute_edge_groups_incomplete": 0,
+            "minute_edge_provider_groups_attempted": 0,
+            "minute_edge_provider_bars_rebuilt": 0,
+            "minute_edge_errors": 0,
         }
-        
-        for interval, query in queries.items():
-            logger.info(f"  -> Aggregating {interval} locally...")
-            self._candle_store._db.execute(query)
-            
-        tables = {
-            "FIFTEEN_MINUTE": "candles_15m",
-            "ONE_HOUR": "candles_1h",
-            "ONE_DAY": "candles_1d"
-        }
-        for iv_enum, table in tables.items():
-            logger.info(f"  -> Updating coverage map for {iv_enum}...")
-            query = f"""
-            INSERT INTO candle_coverage (stock_id, interval, earliest_ts, latest_ts, candle_count, source, last_updated)
-            SELECT 
-                stock_id,
-                %s,
-                MIN(timestamp),
-                MAX(timestamp),
-                COUNT(*),
-                'local_aggregate',
-                NOW()
-            FROM {table}
-            GROUP BY stock_id
-            ON CONFLICT (stock_id, interval) DO UPDATE SET 
-                latest_ts = EXCLUDED.latest_ts,
-                candle_count = EXCLUDED.candle_count,
-                last_updated = NOW();
-            """
-            self._candle_store._db.execute(query, (iv_enum,))
+        if self._coverage is None:
+            stats["minute_edge_errors"] = 1
+            logger.warning(
+                "Cannot rebuild five-minute edges from one-minute bars without coverage storage"
+            )
+            return stats
+
+        now = datetime.now(IST)
+        lookback_start = self._session_lookback_start(now, lookback_days)
+        gaps = self._coverage.find_recent_session_edge_gaps(
+            interval=CandleInterval.FIVE_MINUTE.value,
+            start=lookback_start,
+            end=now,
+            exchange=exchange,
+            stock_ids=stock_ids,
+        )
+        stats["minute_edge_sessions_found"] = len(gaps)
+
+        requested: set[tuple[int, date, dt_time]] = set()
+        expected_close = self._final_session_bar_time(CandleInterval.FIVE_MINUTE)
+        for gap in gaps:
+            if not gap["has_open"]:
+                requested.add((gap["stock_id"], gap["session_date"], MARKET_OPEN))
+            if not gap["has_close"]:
+                requested.add((gap["stock_id"], gap["session_date"], expected_close))
+
+        bars = sorted(requested, key=lambda item: (item[1], item[0], item[2]))
+        stats["minute_edge_groups_requested"] = len(bars)
+        if not bars:
+            return stats
+
+        try:
+            aggregated = self._candle_store.aggregate_complete_one_minute_groups(bars)
+            rows = [
+                (
+                    row["stock_id"],
+                    row["timestamp"],
+                    row["open"],
+                    row["high"],
+                    row["low"],
+                    row["close"],
+                    row["volume"],
+                    row["vwap"],
+                )
+                for row in aggregated
+            ]
+
+            # For a specifically requested historical repair, SmartAPI may
+            # still have the missing one-minute group even when it was never
+            # stored locally. Fetch only that five-minute edge, and keep the
+            # same strict all-five-minutes completeness requirement.
+            if fetch_missing_groups and self._fetcher is not None:
+                resolved = {
+                    (row[0], row[1].astimezone(IST).date(), row[1].astimezone(IST).time().replace(tzinfo=None))
+                    for row in rows
+                }
+                gap_by_stock_date = {
+                    (gap["stock_id"], gap["session_date"]): gap
+                    for gap in gaps
+                }
+                for stock_id, session_date, bar_start in bars:
+                    key = (stock_id, session_date, bar_start)
+                    if key in resolved:
+                        continue
+                    gap = gap_by_stock_date.get((stock_id, session_date))
+                    if not gap:
+                        continue
+                    start = datetime.combine(session_date, bar_start, tzinfo=IST)
+                    end = start + timedelta(minutes=5)
+                    stats["minute_edge_provider_groups_attempted"] += 1
+                    try:
+                        candles = self._fetcher.get_candles_range(
+                            symbol=gap["symbol"],
+                            token=gap["token"],
+                            start=start,
+                            end=end,
+                            interval=CandleInterval.ONE_MINUTE,
+                            exchange=Exchange(exchange) if isinstance(exchange, str) else exchange,
+                        )
+                        minute_by_time = {
+                            candle.timestamp.astimezone(IST).replace(second=0, microsecond=0): candle
+                            for candle in candles
+                        }
+                        expected = [start + timedelta(minutes=index) for index in range(5)]
+                        if not all(timestamp in minute_by_time for timestamp in expected):
+                            if stats["minute_edge_provider_groups_attempted"] % 25 == 0:
+                                logger.info(
+                                    "One-minute edge fetch progress: {}/{} groups",
+                                    stats["minute_edge_provider_groups_attempted"],
+                                    len(bars) - len(aggregated),
+                                )
+                            continue
+                        minute_group = [minute_by_time[timestamp] for timestamp in expected]
+                        volume = sum(int(candle.volume) for candle in minute_group)
+                        vwap = (
+                            sum(float(candle.vwap or 0) * int(candle.volume) for candle in minute_group) / volume
+                            if volume
+                            else 0
+                        )
+                        rows.append(
+                            (
+                                stock_id,
+                                start,
+                                minute_group[0].open,
+                                max(candle.high for candle in minute_group),
+                                min(candle.low for candle in minute_group),
+                                minute_group[-1].close,
+                                volume,
+                                vwap,
+                            )
+                        )
+                        resolved.add(key)
+                        stats["minute_edge_provider_bars_rebuilt"] += 1
+                    except Exception as exc:
+                        stats["minute_edge_errors"] += 1
+                        logger.warning(
+                            "Could not fetch one-minute edge group for {} on {} ({})",
+                            gap["symbol"],
+                            session_date,
+                            type(exc).__name__,
+                        )
+                    if stats["minute_edge_provider_groups_attempted"] % 25 == 0:
+                        logger.info(
+                            "One-minute edge fetch progress: {}/{} groups",
+                            stats["minute_edge_provider_groups_attempted"],
+                            len(bars) - len(aggregated),
+                        )
+
+            if rows:
+                self._candle_store.insert_batch(CandleInterval.FIVE_MINUTE, rows)
+                touched_stock_ids = {row[0] for row in rows}
+                for stock_id in touched_stock_ids:
+                    self._coverage.refresh_stock_from_table(
+                        stock_id,
+                        CandleInterval.FIVE_MINUTE.value,
+                    )
+            stats["minute_edge_bars_rebuilt"] = len(rows)
+            stats["minute_edge_groups_incomplete"] = len(bars) - len(rows)
+        except Exception as exc:
+            stats["minute_edge_errors"] = 1
+            logger.warning("Could not rebuild five-minute edges from one-minute data: {}", exc)
+
+        logger.info(
+            "One-minute edge aggregation: rebuilt {}/{} missing five-minute bars; "
+            "{} groups lacked all five source candles ({} fetched, {} rebuilt)",
+            stats["minute_edge_bars_rebuilt"],
+            stats["minute_edge_groups_requested"],
+            stats["minute_edge_groups_incomplete"],
+            stats["minute_edge_provider_groups_attempted"],
+            stats["minute_edge_provider_bars_rebuilt"],
+        )
+        return stats
 
     # ── Bhavcopy Persistence ─────────────────────────────
 
@@ -932,6 +1613,7 @@ class DataIngestionService:
                     token=gap["token"],
                     days=fetch_days,
                     interval=interval,
+                    exchange=Exchange(exchange) if isinstance(exchange, str) else exchange,
                 )
 
                 if candles:
@@ -1170,314 +1852,3 @@ class DataIngestionService:
             high_52w=float(row.get("high_52w") or 0),
             low_52w=float(row.get("low_52w") or 0),
         )
-
-    # ── Gap Detection & Hole Filling ─────────────────────
-
-    @staticmethod
-    def _min_expected_candles(interval: CandleInterval, days: int) -> int:
-        """
-        Minimum expected candle count to consider coverage 'complete'.
-
-        Uses 80% of theoretical max to account for holidays,
-        half-days, and minor variations.
-        """
-        # Approximate trading days = days * 5/7 (exclude weekends)
-        trading_days = int(days * 5 / 7)
-        candles_per_day = {
-            CandleInterval.ONE_MINUTE: 375,    # 9:15-15:30 = 375 minutes
-            CandleInterval.FIVE_MINUTE: 75,
-            CandleInterval.FIFTEEN_MINUTE: 25,
-            CandleInterval.ONE_HOUR: 6,
-            CandleInterval.ONE_DAY: 1,
-            CandleInterval.ONE_WEEK: 0.2,      # ~1 per 5 trading days
-        }
-        per_day = candles_per_day.get(interval, 1)
-        return int(trading_days * per_day * 0.80)
-
-    @staticmethod
-    def _group_consecutive_dates(dates: list[date]) -> list[tuple[date, date]]:
-        """
-        Group consecutive dates into (start, end) ranges to minimize API calls.
-
-        Example:
-            [Jan 15, Jan 16, Jan 17, Feb 2, Feb 3]
-            → [(Jan 15, Jan 17), (Feb 2, Feb 3)]
-
-        Instead of 5 API calls (one per date), we make 2 (one per range).
-        """
-        if not dates:
-            return []
-
-        sorted_dates = sorted(dates)
-        ranges: list[tuple[date, date]] = []
-        range_start = sorted_dates[0]
-        range_end = sorted_dates[0]
-
-        for d in sorted_dates[1:]:
-            if (d - range_end).days <= 1:
-                # Consecutive (or same day) — extend current range
-                range_end = d
-            else:
-                # Gap found — close current range, start new one
-                ranges.append((range_start, range_end))
-                range_start = d
-                range_end = d
-
-        # Close the last range
-        ranges.append((range_start, range_end))
-        return ranges
-
-    def fill_holes(
-        self,
-        interval: CandleInterval = CandleInterval.FIVE_MINUTE,
-        exchange: str = "NSE",
-        time_budget_minutes: float = 30.0,
-        batch_pause: float = 0.3,
-    ) -> dict[str, Any]:
-        """
-        Detect and fill missing candle data for ALL active stocks.
-
-        Keeps running until either:
-          - All holes are filled, OR
-          - time_budget_minutes have elapsed
-
-        Remaining unfilled holes stay as absent rows in the candle table.
-        They'll be detected and retried on the next run (next restart,
-        next post_market, next warm-up).
-
-        Args:
-            interval: Candle interval to check.
-            exchange: Stock exchange filter.
-            time_budget_minutes: Max time to spend filling holes.
-            batch_pause: Seconds to pause between API calls.
-
-        Returns:
-            Stats dict with stocks_checked, stocks_with_holes, holes_filled,
-            candles_added, still_missing, errors, elapsed_seconds, stopped_reason.
-        """
-        if not self._coverage:
-            logger.warning("fill_holes: no coverage store configured, skipping")
-            return {"error": "no coverage store"}
-
-        start_time = time.time()
-        deadline = start_time + (time_budget_minutes * 60)
-
-        stats: dict[str, Any] = {
-            "stocks_checked": 0,
-            "stocks_with_holes": 0,
-            "holes_filled": 0,
-            "candles_added": 0,
-            "still_missing": 0,
-            "errors": 0,
-            "elapsed_seconds": 0.0,
-            "stopped_reason": "all_filled",
-        }
-
-        # 1. Detect all holes
-        logger.info(f"fill_holes({interval.value}): detecting missing trading days...")
-        stocks_with_holes = self._coverage.find_all_holes(interval.value, exchange)
-        stats["stocks_checked"] = len(self._stock_store.get_all_active(exchange=exchange))
-        stats["stocks_with_holes"] = len(stocks_with_holes)
-
-        if not stocks_with_holes:
-            stats["elapsed_seconds"] = time.time() - start_time
-            logger.info(f"fill_holes({interval.value}): no holes found — all data complete")
-            return stats
-
-        total_missing_days = sum(len(s["missing_dates"]) for s in stocks_with_holes)
-        logger.info(
-            f"fill_holes({interval.value}): found {len(stocks_with_holes)} stocks "
-            f"with {total_missing_days} total missing stock-days. "
-            f"Time budget: {time_budget_minutes} min"
-        )
-
-        # 2. Fill holes stock by stock
-        for stock_info in stocks_with_holes:
-            # Check time budget
-            if time.time() >= deadline:
-                stats["stopped_reason"] = "time_budget"
-                logger.info(
-                    f"fill_holes({interval.value}): time budget exhausted "
-                    f"after {time_budget_minutes} min"
-                )
-                break
-
-            sid = stock_info["stock_id"]
-            symbol = stock_info["symbol"]
-            token = stock_info["token"]
-            missing_dates = stock_info["missing_dates"]
-
-            # Group consecutive missing dates into ranges
-            date_ranges = self._group_consecutive_dates(missing_dates)
-
-            stock_candles_added = 0
-            stock_errors = 0
-
-            for range_start, range_end in date_ranges:
-                # Check time budget before each API call
-                if time.time() >= deadline:
-                    stats["stopped_reason"] = "time_budget"
-                    break
-
-                try:
-                    # Convert dates to datetimes for the API
-                    from core.constants import IST as _IST
-                    fetch_start = datetime.combine(
-                        range_start, datetime.min.time()
-                    ).replace(hour=9, minute=15, tzinfo=_IST)
-                    fetch_end = datetime.combine(
-                        range_end, datetime.min.time()
-                    ).replace(hour=15, minute=30, tzinfo=_IST)
-
-                    candles = self._fetcher.get_candles_range(
-                        symbol=symbol,
-                        token=token,
-                        start=fetch_start,
-                        end=fetch_end,
-                        interval=interval,
-                    )
-
-                    if candles:
-                        if interval == CandleInterval.ONE_DAY:
-                            rows = [
-                                (
-                                    sid, c.timestamp, c.open, c.high, c.low,
-                                    c.close, c.volume, c.vwap,
-                                    getattr(c, "delivery_qty", 0) or 0,
-                                    getattr(c, "delivery_pct", 0) or 0,
-                                )
-                                for c in candles
-                            ]
-                        else:
-                            rows = [
-                                (
-                                    sid, c.timestamp, c.open, c.high, c.low,
-                                    c.close, c.volume, c.vwap,
-                                )
-                                for c in candles
-                            ]
-                        self._candle_store.insert_batch(interval, rows)
-                        stock_candles_added += len(rows)
-                    else:
-                        # Angel One returned 0 candles. Mark these trading days as empty.
-                        if self._coverage:
-                            empty_days = self._coverage.get_trading_days(range_start, range_end)
-                            for eday in empty_days:
-                                self._coverage.mark_empty_day(sid, interval.value, eday)
-                            logger.debug(f"fill_holes: {symbol} — Marked {len(empty_days)} days as empty (0 candles returned)")
-
-                    time.sleep(batch_pause)
-
-                except DataFetchError as e:
-                    stock_errors += 1
-                    logger.debug(
-                        f"fill_holes: API error for {symbol} "
-                        f"({range_start} to {range_end}): {e}"
-                    )
-                except Exception as e:
-                    stock_errors += 1
-                    logger.warning(
-                        f"fill_holes: unexpected error for {symbol} "
-                        f"({range_start} to {range_end}): {e}"
-                    )
-
-            if stock_candles_added > 0:
-                stats["holes_filled"] += 1
-                stats["candles_added"] += stock_candles_added
-                logger.debug(
-                    f"fill_holes: {symbol} — {stock_candles_added} candles added "
-                    f"across {len(date_ranges)} date ranges"
-                )
-            elif stock_errors > 0:
-                stats["still_missing"] += 1
-
-            stats["errors"] += stock_errors
-
-        # 3. Refresh coverage counts from actual data
-        if stats["candles_added"] > 0 and self._coverage:
-            try:
-                self._coverage.refresh_candle_counts(interval.value)
-            except Exception as e:
-                logger.warning(f"fill_holes: coverage refresh failed: {e}")
-
-        stats["elapsed_seconds"] = round(time.time() - start_time, 1)
-        logger.info(
-            f"fill_holes({interval.value}) complete: "
-            f"{stats['holes_filled']} stocks repaired, "
-            f"{stats['candles_added']:,} candles added, "
-            f"{stats['still_missing']} still missing, "
-            f"{stats['errors']} errors, "
-            f"{stats['elapsed_seconds']}s elapsed "
-            f"({stats['stopped_reason']})"
-        )
-        return stats
-
-    def detect_and_report_gaps(
-        self,
-        interval: CandleInterval = CandleInterval.FIVE_MINUTE,
-        exchange: str = "NSE",
-    ) -> dict[str, Any]:
-        """
-        Diagnostic-only method: detect ALL gaps for ALL stocks without
-        fetching anything. Returns a report for logging/debugging.
-
-        Returns:
-            {
-                "no_coverage": [...],
-                "stale_coverage": [...],
-                "stocks_with_holes": [...],
-                "summary": {
-                    "total_stocks": N,
-                    "fully_complete": N,
-                    "with_holes": N,
-                    "no_data": N,
-                    "total_missing_stock_days": N,
-                }
-            }
-        """
-        if not self._coverage:
-            return {"error": "no coverage store"}
-
-        all_stocks = self._stock_store.get_all_active(exchange=exchange)
-        all_stock_ids = {s["id"] for s in all_stocks}
-
-        # Stocks with no coverage at all
-        covered = self._coverage.get_all_for_interval(interval.value)
-        covered_ids = {c["stock_id"] for c in covered}
-        no_coverage = [
-            {"stock_id": s["id"], "symbol": s["symbol"], "token": s["token"]}
-            for s in all_stocks if s["id"] not in covered_ids
-        ]
-
-        # Stale coverage (latest_ts > 2 days old)
-        stale = self._coverage.find_stale(interval.value, stale_hours=48)
-
-        # Intra-coverage holes
-        stocks_with_holes = self._coverage.find_all_holes(interval.value, exchange)
-
-        total_missing_days = sum(len(s["missing_dates"]) for s in stocks_with_holes)
-        with_holes_count = len(stocks_with_holes)
-
-        report = {
-            "no_coverage": no_coverage,
-            "stale_coverage": stale,
-            "stocks_with_holes": stocks_with_holes,
-            "summary": {
-                "total_stocks": len(all_stocks),
-                "fully_complete": len(all_stocks) - len(no_coverage) - with_holes_count,
-                "with_holes": with_holes_count,
-                "no_data": len(no_coverage),
-                "stale": len(stale),
-                "total_missing_stock_days": total_missing_days,
-            },
-        }
-
-        logger.info(
-            f"Gap report ({interval.value}): "
-            f"{report['summary']['total_stocks']} total, "
-            f"{report['summary']['fully_complete']} complete, "
-            f"{report['summary']['with_holes']} with holes, "
-            f"{report['summary']['no_data']} no data, "
-            f"{report['summary']['total_missing_stock_days']} missing stock-days"
-        )
-        return report

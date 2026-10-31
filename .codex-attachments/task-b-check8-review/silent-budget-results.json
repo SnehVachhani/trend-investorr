@@ -1,0 +1,16 @@
+{
+  "case": "repeated sockets open without ever delivering pong or tick, each silently times out",
+  "silent_failures": 6,
+  "configured_retry_limit": 5,
+  "retry_count_after_each_recovery": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    5
+  ],
+  "is_running": false,
+  "exhausted": true,
+  "sdk_instances": 6
+}

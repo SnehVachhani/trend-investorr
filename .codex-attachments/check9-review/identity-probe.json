@@ -1,0 +1,8 @@
+{
+  "scenario": "NSE submission unknown; unrelated cancelled BSE order carries same tag",
+  "first_status": "UNKNOWN",
+  "second_status": "UNKNOWN",
+  "NSE_submissions": 2,
+  "original_NSE_order_still_hidden": true,
+  "same_tag": true
+}

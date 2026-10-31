@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getOrders } from '@/lib/api';
 import type { Order } from '@/lib/types';
+import StockIdentity from '@/components/StockIdentity';
 
 export default function OrdersPage() {
   const router = useRouter();
@@ -62,7 +63,8 @@ export default function OrdersPage() {
             <thead>
               <tr>
                 <th>Time</th>
-                <th>Symbol</th>
+                <th>Stock</th>
+                <th>Sector</th>
                 <th>Side</th>
                 <th>Qty</th>
                 <th>Price</th>
@@ -83,7 +85,8 @@ export default function OrdersPage() {
                       minute: '2-digit',
                     })}
                   </td>
-                  <td style={{ fontWeight: 600 }}>{ord.symbol}</td>
+                  <td><StockIdentity symbol={ord.symbol} name={ord.name} company_name={ord.company_name} /></td>
+                  <td>{ord.sector || '—'}</td>
                   <td>
                     <span className={`badge ${ord.transaction_type === 'BUY' ? 'badge-buy' : 'badge-sell'}`}>
                       {ord.transaction_type}

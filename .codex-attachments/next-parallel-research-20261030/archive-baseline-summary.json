@@ -1,0 +1,86 @@
+{
+  "tests.data.test_incremental_sync": {
+    "passed": 8,
+    "failed": 7,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.data.test_historical_fetcher": {
+    "passed": 7,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.api.test_startup_candle_sync": {
+    "passed": 3,
+    "failed": 3,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.strategies.test_fundamental_setup_backtester": {
+    "passed": 24,
+    "failed": 1,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.strategies.test_profile_backtester": {
+    "passed": 13,
+    "failed": 1,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.api.test_fundamental_query_api": {
+    "passed": 6,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.trading.test_charges": {
+    "passed": 4,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.api.test_enhanced_momentum_replay_workers": {
+    "passed": 10,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.api.test_enhanced_momentum_backtest_job_durability": {
+    "passed": 18,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.data.test_websocket_subscriptions": {
+    "passed": 16,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.data.test_websocket_reconnect": {
+    "passed": 10,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.data.test_websocket_generations": {
+    "passed": 10,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.data.test_websocket_health": {
+    "passed": 9,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "tests.data.test_live_candle_pipeline": {
+    "passed": 27,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}

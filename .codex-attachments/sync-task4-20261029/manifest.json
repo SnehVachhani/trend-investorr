@@ -1,0 +1,70 @@
+[
+  {
+    "path": "core/constants.py",
+    "existed": true,
+    "final_sha256": "eaa98c05d5a3c6ba5a78445c5c6a19e69517b0e2488e0d5ecb3ef4e2672912ee",
+    "original_sha256": "31c88f587d01a5c15a22ad7814ac43f1cd1da70bc5a0d251407f67f99ed778ba"
+  },
+  {
+    "path": "main.py",
+    "existed": true,
+    "final_sha256": "b248ba3c2c638fb7db7b4f0c600520077fc8df7eaf942a086a743029c28d7d23",
+    "original_sha256": "a0c551cef63431537f76fb8a0b1466b94c55a9dcc2cab60f1a196121d2dc85e1"
+  },
+  {
+    "path": "tests/trading/test_live_buy_broker_state.py",
+    "existed": false,
+    "final_sha256": "2e1c280b87eec39ea14c7ea61133e3dd3110b471173448720c414978cc7d5709"
+  },
+  {
+    "path": "tests/trading/test_live_entry_reservation.py",
+    "existed": false,
+    "final_sha256": "a0b6af82265b65cc96c9bb6b4a55708fa2f9cf068d4c371de68bd6fbdc6e83b3"
+  },
+  {
+    "path": "tests/trading/test_live_sell_exposure.py",
+    "existed": true,
+    "final_sha256": "6472a672487d649d819e5fedbe50f67a411063f19d25d1114d7aac4d342fe728",
+    "original_sha256": "7d8db729c47ad09f55da92f84a73a83b2ac4544481c81a6044ae04bbf78040c4"
+  },
+  {
+    "path": "tests/trading/test_live_square_off_coordination.py",
+    "existed": false,
+    "final_sha256": "0d1a0e962fc5116b9f5c7ad81b538aecd0599dc0b0b44a497f648c81aa0c2297"
+  },
+  {
+    "path": "tests/trading/test_live_squareoff.py",
+    "existed": true,
+    "final_sha256": "01388b7929d848566e4ec852f81f5cb34a36522baad523030def0201c398acb4",
+    "original_sha256": "4ee025d7ef3bf1d7e23ee5ecaf4d70d571f648d81d575e0432042da69bec359c"
+  },
+  {
+    "path": "trading/circuit_breaker.py",
+    "existed": true,
+    "final_sha256": "cb2143a93f093c58bcc88cfe3785eb2602111c92712c31bb6839086b14982285",
+    "original_sha256": "0a4c2d34461ed12cd5066cb5f5ac0e350de3687740935d5cbbf221e8037573e3"
+  },
+  {
+    "path": "trading/entry_reservation_store.py",
+    "existed": false,
+    "final_sha256": "f778c8b40bd6c527aee98dc84e2d3182e77aacd3480a9aa746e5135ceecf1df4"
+  },
+  {
+    "path": "trading/order_manager.py",
+    "existed": true,
+    "final_sha256": "28316845cefcebb9ec10fb07f66bc635e496c8a8c5ad61a98e7858c7fe49d754",
+    "original_sha256": "38538331b68f01831774f351867acba26174aa77bb84d9a7a3a339456578ff22"
+  },
+  {
+    "path": "trading/risk_manager.py",
+    "existed": true,
+    "final_sha256": "6ca0461c832011d6dccc9de8f181b15b112cca951b8d041a2e1147bc579e884a",
+    "original_sha256": "aaca4baa0449ed5f75825adf12221edc31974257496e9dc1f3e26e63401deea6"
+  },
+  {
+    "path": "trading/square_off_followup.py",
+    "existed": true,
+    "final_sha256": "af20571236415dda3ddcadb5f7787bd9fdf4a3027cd9de6ca083a426bb6a4652",
+    "original_sha256": "a25b7f3397fa359d19e8397e8abdf59dd19ed33766b84761cdf4f7f7472f537f"
+  }
+]

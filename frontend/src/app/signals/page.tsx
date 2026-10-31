@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getSignals, getScannerSignals } from '@/lib/api';
 import type { Signal, ScannerSignal } from '@/lib/types';
+import StockIdentity from '@/components/StockIdentity';
 
 export default function SignalsPage() {
   const router = useRouter();
@@ -60,7 +61,8 @@ export default function SignalsPage() {
               <thead>
                 <tr>
                   <th>Time</th>
-                  <th>Symbol</th>
+                  <th>Stock</th>
+                  <th>Sector</th>
                   <th>Type</th>
                   <th>Strength</th>
                   <th>Score</th>
@@ -75,7 +77,8 @@ export default function SignalsPage() {
                     <td style={{ fontSize: 12, color: 'var(--text-tertiary)', fontFamily: "'JetBrains Mono', monospace" }}>
                       {new Date(sig.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' })}
                     </td>
-                    <td style={{ fontWeight: 600 }}>{sig.symbol}</td>
+                    <td><StockIdentity symbol={sig.symbol} name={sig.name} company_name={sig.company_name} /></td>
+                    <td>{sig.sector || '—'}</td>
                     <td><span className={`badge ${sig.signal_type === 'BUY' ? 'badge-buy' : 'badge-sell'}`}>{sig.signal_type}</span></td>
                     <td><span className={`badge badge-${sig.strength?.toLowerCase()}`}>{sig.strength}</span></td>
                     <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>{sig.score?.toFixed(3)}</td>
@@ -96,7 +99,8 @@ export default function SignalsPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Symbol</th>
+                <th>Stock</th>
+                <th>Sector</th>
                 <th>Scanner</th>
                 <th>Pattern</th>
                 <th>Direction</th>
@@ -108,7 +112,8 @@ export default function SignalsPage() {
             <tbody>
               {scannerSignals.map((sig) => (
                 <tr key={sig.id} onClick={() => router.push(`/stocks/${sig.symbol}`)}>
-                  <td style={{ fontWeight: 600 }}>{sig.symbol}</td>
+                  <td><StockIdentity symbol={sig.symbol} name={sig.name} company_name={sig.company_name} /></td>
+                  <td>{sig.sector || '—'}</td>
                   <td style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{sig.scanner_name}</td>
                   <td>{sig.pattern}</td>
                   <td>

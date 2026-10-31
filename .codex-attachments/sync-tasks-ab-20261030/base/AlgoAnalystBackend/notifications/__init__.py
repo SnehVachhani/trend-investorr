@@ -1,0 +1,1 @@
+"""Trend-Investorr: Notifications package."""

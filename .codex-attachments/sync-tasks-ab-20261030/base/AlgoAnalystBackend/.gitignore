@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.vault
+.vault.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & Logs
+data_cache/
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Exported Data
+export_*.csv
+*squirrel*.sql
+
+# Generated dependencies and test output
+node_modules/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.hypothesis/
+.cache/
+htmlcov/
+coverage/
+.coverage
+.coverage.*
+
+# Local configuration
+.env.*
+!.env.example
+
+# Private runtime and local tooling
+.codex-attachments/
+graphify-out/
+reports/
+entry_reservations/
+square_off_intents/

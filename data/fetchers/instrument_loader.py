@@ -27,6 +27,7 @@ from loguru import logger
 
 from core.constants import Exchange, IST
 from core.exceptions import DataFetchError, InstrumentNotFoundError
+from core.universe import is_equity_stock
 from data.models.market_data import Stock
 
 
@@ -60,6 +61,7 @@ class InstrumentLoader:
         # In-memory lookups
         self._by_symbol: dict[str, Stock] = {}       # "RELIANCE" -> Stock
         self._by_token: dict[str, Stock] = {}         # "2885" -> Stock
+        self._by_exchange_token: dict[tuple[str, Exchange], Stock] = {}
         self._by_exchange: dict[Exchange, list[Stock]] = {}
 
         self._df: pd.DataFrame | None = None          # Raw DataFrame
@@ -232,19 +234,27 @@ class InstrumentLoader:
         """Build in-memory lookup dictionaries from raw instrument data."""
         self._by_symbol.clear()
         self._by_token.clear()
+        self._by_exchange_token.clear()
         self._by_exchange.clear()
 
         count = 0
         for item in data:
             try:
-                symbol = item.get("symbol", "").strip()
-                token = item.get("token", "").strip()
-                name = item.get("name", symbol)
-                exch_str = item.get("exch_seg", "").upper()
-                series = item.get("symbol", "").split("-")[-1] if "-" in item.get("symbol", "") else "EQ"
-                
-                if token.startswith("999"):
-                    series = "IDX"
+                symbol = str(item.get("symbol") or "").strip()
+                token = str(item.get("token") or "").strip()
+                name = str(item.get("name") or symbol).strip()
+                exch_str = str(item.get("exch_seg") or "").upper().strip()
+                instrument_type = str(item.get("instrumenttype") or "").upper().strip()
+                # BSE cash-market symbols do not carry NSE's -EQ suffix. Store
+                # their regular equity series as EQ, regardless of punctuation
+                # that may be part of the BSE trading symbol itself.
+                series = (
+                    "IDX"
+                    if instrument_type == "AMXIDX"
+                    else "EQ"
+                    if exch_str == "BSE"
+                    else symbol.split("-")[-1] if "-" in symbol else "EQ"
+                )
                 lot_size = int(item.get("lotsize", 1) or 1)
 
                 if not symbol or not token:
@@ -261,13 +271,22 @@ class InstrumentLoader:
                     exchange=exchange,
                     series=series,
                     lot_size=lot_size,
+                    instrument_type=instrument_type,
                 )
 
                 # Primary lookup: symbol@exchange (handles duplicates across exchanges)
                 key = f"{symbol}@{exchange.value}"
                 self._by_symbol[key] = stock
-                self._by_symbol[symbol] = stock  # Also plain symbol (last write wins)
-                self._by_token[token] = stock
+                # Keep an unqualified lookup NSE-first so cross-listed names
+                # do not become dependent on provider row order.
+                if exchange == Exchange.NSE or symbol not in self._by_symbol:
+                    self._by_symbol[symbol] = stock
+                self._by_exchange_token[(token, exchange)] = stock
+                # SmartAPI tokens are not globally unique across exchanges.
+                # Preserve a stable NSE-first fallback for legacy token-only
+                # callers, while supporting explicit exchange lookups.
+                if exchange == Exchange.NSE or token not in self._by_token:
+                    self._by_token[token] = stock
 
                 # Exchange grouping
                 if exchange not in self._by_exchange:
@@ -322,9 +341,10 @@ class InstrumentLoader:
         if stock:
             return stock
 
-        # Fall back to plain symbol
+        # Fall back to a plain symbol only when it belongs to the requested
+        # exchange; NSE and BSE frequently share the same ticker text.
         stock = self._by_symbol.get(symbol)
-        if stock:
+        if stock and stock.exchange == exchange:
             return stock
 
         raise InstrumentNotFoundError(
@@ -333,12 +353,13 @@ class InstrumentLoader:
             loaded_count=self._total_instruments,
         )
 
-    def get_by_token(self, token: str) -> Stock:
+    def get_by_token(self, token: str, exchange: Exchange | None = None) -> Stock:
         """
         Look up a stock by its SmartAPI token.
 
         Args:
             token: SmartAPI instrument token (e.g., "2885").
+            exchange: Optional exchange for tokens that exist on both venues.
 
         Returns:
             Stock dataclass.
@@ -348,7 +369,11 @@ class InstrumentLoader:
         """
         self._ensure_loaded()
 
-        stock = self._by_token.get(token)
+        stock = (
+            self._by_exchange_token.get((token, exchange))
+            if exchange is not None
+            else self._by_token.get(token)
+        )
         if stock:
             return stock
 
@@ -396,19 +421,35 @@ class InstrumentLoader:
     #   SM = SME platform stocks (NSE Emerge)
     #   ST = SME trade-to-trade
     #   BZ = Trade-to-trade under ASM/GSM surveillance
-    EQUITY_SERIES = frozenset({"EQ", "BE", "SM", "ST", "BZ", "IDX"})
+    EQUITY_SERIES = frozenset({"EQ", "BE", "SM", "ST", "BZ"})
 
     def get_nse_equity_symbols(self) -> list[str]:
         """Get all NSE equity symbols (all tradeable equity series)."""
         self._ensure_loaded()
         return [
             s.symbol for s in self._by_exchange.get(Exchange.NSE, [])
-            if s.series in self.EQUITY_SERIES
+            if not s.instrument_type and s.series in self.EQUITY_SERIES
+        ]
+
+    def get_bse_equity_symbols(self) -> list[str]:
+        """Get BSE cash-market company equities, excluding index instruments."""
+        self._ensure_loaded()
+        return [
+            stock.symbol
+            for stock in self._by_exchange.get(Exchange.BSE, [])
+            if not stock.instrument_type
+            and is_equity_stock({
+                "exchange": stock.exchange.value,
+                "series": stock.series,
+                "symbol": stock.symbol,
+                "name": stock.name,
+                "token": stock.token,
+            })
         ]
 
     def sync_to_db(self, db) -> int:
         """
-        Sync the loaded NSE equities to the PostgreSQL database.
+        Sync the loaded NSE and BSE company equities to PostgreSQL.
         
         Args:
             db: Database instance to use.
@@ -419,14 +460,44 @@ class InstrumentLoader:
         self._ensure_loaded()
         from storage.models import StockStore
         
-        # Sync all tradeable NSE equities (EQ + BE + SM + ST + BZ)
-        # Excludes bonds (N*), gold (SG), mutual funds (MF), T-bills (TB), etc.
-        nse_stocks = [
-            s for s in self._by_exchange.get(Exchange.NSE, [])
-            if s.series in self.EQUITY_SERIES
-        ]
-        
-        if not nse_stocks:
+        # NSE series identify company equities; BSE's cash-market scrips have
+        # no series suffix, so the instrument type and shared equity rules are
+        # used there. Keep the Nifty and Sensex index rows too: the enhanced
+        # momentum scanner uses them as market-context benchmarks, while their
+        # IDX series keeps them out of every company-equity universe.
+        equity_stocks = []
+        benchmark_stocks = []
+        for exchange in (Exchange.NSE, Exchange.BSE):
+            for stock in self._by_exchange.get(exchange, []):
+                if stock.instrument_type:
+                    symbol_key = stock.symbol.strip().upper()
+                    name_key = stock.name.strip().upper()
+                    if stock.instrument_type == "AMXIDX" and (
+                        (exchange == Exchange.NSE and (
+                            symbol_key in {"NIFTY", "NIFTY 50", "NIFTY50"}
+                            or name_key in {"NIFTY", "NIFTY 50", "NIFTY50"}
+                        ))
+                        or (exchange == Exchange.BSE and (
+                            symbol_key in {"SENSEX", "BSESN"}
+                            or name_key in {"SENSEX", "BSESN"}
+                        ))
+                    ):
+                        benchmark_stocks.append(stock)
+                    continue
+                if exchange == Exchange.NSE and stock.series not in self.EQUITY_SERIES:
+                    continue
+                if not is_equity_stock({
+                    "exchange": stock.exchange.value,
+                    "series": stock.series,
+                    "symbol": stock.symbol,
+                    "name": stock.name,
+                    "token": stock.token,
+                }):
+                    continue
+                equity_stocks.append(stock)
+
+        sync_stocks = equity_stocks + benchmark_stocks
+        if not sync_stocks:
             return 0
             
         # Format for batch upsert: (symbol, token, name, exchange, series, industry, lot_size)
@@ -440,12 +511,34 @@ class InstrumentLoader:
                 s.sector or "", 
                 s.lot_size
             ) 
-            for s in nse_stocks
+            for s in sync_stocks
         ]
         
         store = StockStore(db)
         store.upsert_batch(rows)
-        logger.info(f"Synced {len(rows)} NSE equity instruments to the database")
+        # The BSE instrument master also contains debt securities whose
+        # instrumenttype is blank. Keep those outside the active stock
+        # universe even if an earlier broad import inserted them as EQ.
+        deactivated_non_equities = db.execute(
+            """
+            UPDATE stocks
+            SET is_active = FALSE, updated_at = NOW()
+            WHERE exchange = 'BSE'
+              AND series = 'EQ'
+              AND LEFT(COALESCE(token, ''), 1) <> '5'
+              AND is_active = TRUE
+            """
+        )
+        by_exchange = {
+            exchange.value: sum(1 for stock in sync_stocks if stock.exchange == exchange)
+            for exchange in (Exchange.NSE, Exchange.BSE)
+        }
+        logger.info(
+            "Synced {} stock/benchmark instruments to the database "
+            "(NSE: {}, BSE: {}, deactivated BSE non-equities: {})",
+            len(rows), by_exchange["NSE"], by_exchange["BSE"],
+            deactivated_non_equities,
+        )
         return len(rows)
 
     def _ensure_loaded(self) -> None:

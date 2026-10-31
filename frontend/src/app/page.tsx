@@ -9,6 +9,9 @@ import {
   getSystemStatus,
 } from '@/lib/api';
 import type { PortfolioSummary, Signal, Position, SystemStatus } from '@/lib/types';
+import StockIdentity from '@/components/StockIdentity';
+
+const SYSTEM_STATUS_POLL_INTERVAL_MS = 5_000;
 
 function formatCurrency(n: number): string {
   if (Math.abs(n) >= 10_000_000) return `₹${(n / 10_000_000).toFixed(2)} Cr`;
@@ -30,6 +33,8 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     async function load() {
       try {
         const [p, s, pos, st] = await Promise.all([
@@ -38,17 +43,33 @@ export default function DashboardPage() {
           getPositions(),
           getSystemStatus(),
         ]);
+        if (cancelled) return;
         setPortfolio(p);
         setSignals(s);
         setPositions(pos);
         setStatus(st);
-      } catch (err) {
+      } catch {
         setError('Failed to connect to API. Make sure FastAPI is running on port 8000.');
       } finally {
         setLoading(false);
       }
     }
     load();
+
+    const statusPoll = window.setInterval(() => {
+      getSystemStatus()
+        .then((nextStatus) => {
+          if (!cancelled) setStatus(nextStatus);
+        })
+        .catch(() => {
+          // Keep showing the last known status if a poll is transiently unavailable.
+        });
+    }, SYSTEM_STATUS_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(statusPoll);
+    };
   }, []);
 
   if (loading) {
@@ -78,21 +99,6 @@ export default function DashboardPage() {
             <div className="empty-state-sub">
               Run: uvicorn api.server:app --reload --port 8000
             </div>
-            <button 
-              onClick={() => window.location.reload()}
-              style={{
-                marginTop: '16px',
-                padding: '8px 16px',
-                background: 'var(--accent-primary, #3b82f6)',
-                color: 'white',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: 'pointer',
-                fontWeight: 500
-              }}
-            >
-              Retry Connection
-            </button>
           </div>
         </div>
       </div>
@@ -232,7 +238,8 @@ export default function DashboardPage() {
                   onClick={() => router.push(`/stocks/${sig.symbol}`)}
                 >
                   <div>
-                    <span style={{ fontWeight: 600, fontSize: 13 }}>{sig.symbol}</span>
+                    <StockIdentity symbol={sig.symbol} name={sig.name} company_name={sig.company_name} />
+                    <small style={{ display: 'block', marginTop: 3, color: 'var(--text-tertiary)' }}>Sector: {sig.sector || '—'}</small>
                     <span
                       className={`badge ${sig.signal_type === 'BUY' ? 'badge-buy' : 'badge-sell'}`}
                       style={{ marginLeft: 8 }}
@@ -271,7 +278,8 @@ export default function DashboardPage() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Symbol</th>
+                  <th>Stock</th>
+                  <th>Sector</th>
                   <th>Qty</th>
                   <th>Avg Price</th>
                   <th>Current</th>
@@ -287,7 +295,8 @@ export default function DashboardPage() {
                       : 0;
                   return (
                     <tr key={pos.id} onClick={() => router.push(`/stocks/${pos.symbol}`)}>
-                      <td style={{ fontWeight: 600 }}>{pos.symbol}</td>
+                      <td><StockIdentity symbol={pos.symbol} name={pos.name} company_name={pos.company_name} /></td>
+                      <td>{pos.sector || '—'}</td>
                       <td>{pos.quantity}</td>
                       <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>
                         ₹{pos.avg_buy_price?.toFixed(2)}

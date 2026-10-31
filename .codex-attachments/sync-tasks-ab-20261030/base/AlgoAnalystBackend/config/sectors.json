@@ -1,0 +1,114 @@
+{
+  "sectors": {
+    "IT": {
+      "display_name": "Information Technology",
+      "nifty_index": "NIFTY IT",
+      "keywords": ["IT", "Software", "Computer", "Digital", "Technology", "Information Technology"]
+    },
+    "BANKING": {
+      "display_name": "Banking & Finance",
+      "nifty_index": "NIFTY BANK",
+      "keywords": ["Bank", "Banking", "Financial Services", "NBFC", "Housing Finance"]
+    },
+    "PHARMA": {
+      "display_name": "Pharmaceuticals",
+      "nifty_index": "NIFTY PHARMA",
+      "keywords": ["Pharma", "Pharmaceutical", "Healthcare", "Drug", "Biotech"]
+    },
+    "AUTO": {
+      "display_name": "Automobile",
+      "nifty_index": "NIFTY AUTO",
+      "keywords": ["Automobile", "Auto", "Vehicle", "Motor", "Two Wheeler", "Commercial Vehicle"]
+    },
+    "ENERGY": {
+      "display_name": "Energy & Power",
+      "nifty_index": "NIFTY ENERGY",
+      "keywords": ["Energy", "Power", "Solar", "Wind", "Renewable", "Electricity", "Power Generation"]
+    },
+    "METAL": {
+      "display_name": "Metals & Mining",
+      "nifty_index": "NIFTY METAL",
+      "keywords": ["Metal", "Steel", "Mining", "Iron", "Aluminium", "Copper", "Zinc"]
+    },
+    "FMCG": {
+      "display_name": "FMCG",
+      "nifty_index": "NIFTY FMCG",
+      "keywords": ["FMCG", "Consumer Goods", "Food", "Beverages", "Personal Care", "Household"]
+    },
+    "REALTY": {
+      "display_name": "Real Estate",
+      "nifty_index": "NIFTY REALTY",
+      "keywords": ["Real Estate", "Realty", "Construction", "Housing", "Property"]
+    },
+    "INFRA": {
+      "display_name": "Infrastructure",
+      "nifty_index": "NIFTY INFRA",
+      "keywords": ["Infrastructure", "Construction", "Engineering", "Capital Goods", "Industrial"]
+    },
+    "MEDIA": {
+      "display_name": "Media & Entertainment",
+      "nifty_index": "NIFTY MEDIA",
+      "keywords": ["Media", "Entertainment", "Broadcasting", "Film", "OTT", "Publishing"]
+    },
+    "TELECOM": {
+      "display_name": "Telecom",
+      "nifty_index": "",
+      "keywords": ["Telecom", "Telecommunication", "Wireless", "Mobile", "Internet Service"]
+    },
+    "DEFENCE": {
+      "display_name": "Defence",
+      "nifty_index": "",
+      "keywords": ["Defence", "Defense", "Aerospace", "Shipbuilding", "Ordnance", "Military"]
+    },
+    "CHEMICAL": {
+      "display_name": "Chemicals",
+      "nifty_index": "",
+      "keywords": ["Chemical", "Chemicals", "Agrochemical", "Specialty Chemical", "Petrochemical"]
+    },
+    "TEXTILE": {
+      "display_name": "Textiles",
+      "nifty_index": "",
+      "keywords": ["Textile", "Garment", "Apparel", "Fabric", "Yarn", "Cotton"]
+    },
+    "CEMENT": {
+      "display_name": "Cement",
+      "nifty_index": "",
+      "keywords": ["Cement", "Building Material"]
+    },
+    "FERTILIZER": {
+      "display_name": "Fertilizers",
+      "nifty_index": "",
+      "keywords": ["Fertilizer", "Fertiliser", "Agri Input", "Pesticide"]
+    },
+    "SUGAR": {
+      "display_name": "Sugar",
+      "nifty_index": "",
+      "keywords": ["Sugar", "Ethanol", "Distillery"]
+    },
+    "INSURANCE": {
+      "display_name": "Insurance",
+      "nifty_index": "",
+      "keywords": ["Insurance", "Life Insurance", "General Insurance", "Health Insurance"]
+    },
+    "PSU": {
+      "display_name": "Public Sector",
+      "nifty_index": "NIFTY PSE",
+      "keywords": ["PSU", "Public Sector", "Government", "State Owned"]
+    },
+    "EV": {
+      "display_name": "Electric Vehicles",
+      "nifty_index": "",
+      "keywords": ["Electric Vehicle", "EV", "Battery", "Lithium", "Charging"]
+    },
+    "RAILWAY": {
+      "display_name": "Railways",
+      "nifty_index": "",
+      "keywords": ["Railway", "Rail", "Train", "Wagon", "Coach", "Locomotive"]
+    },
+    "OTHER": {
+      "display_name": "Other",
+      "nifty_index": "",
+      "keywords": []
+    }
+  }
+}

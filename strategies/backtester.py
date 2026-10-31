@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 from loguru import logger
+from trading.charges import ChargeBreakdown, DeliveryChargeConfig
+from engine.swing_volume_profile import build_swing_volume_profile_states
 
 
 # ── Result Data Models ────────────────────────────────────────
@@ -66,6 +68,7 @@ class BacktestResult:
     avg_loss_pct: float = 0.0
     profit_factor: float = 0.0
     avg_hold_days: float = 0.0
+    total_charges: float = 0.0
     max_consecutive_wins: int = 0
     max_consecutive_losses: int = 0
 
@@ -154,6 +157,7 @@ class Backtester:
         symbol: str = "",
         initial_capital: float = 1_000_000,
         position_size_pct: float = 10.0,
+        charge_config: DeliveryChargeConfig | None = None,
     ):
         """
         Args:
@@ -169,6 +173,7 @@ class Backtester:
         self.symbol = symbol
         self.initial_capital = initial_capital
         self.position_size_pct = position_size_pct
+        self.charge_config = charge_config or DeliveryChargeConfig()
 
         # Pre-compute numpy arrays
         self.closes = np.array([c["close"] for c in candles], dtype=float)
@@ -181,22 +186,79 @@ class Backtester:
             for c in candles
         ]
 
+    def _entry(self, capital: float, price: float) -> tuple[int, ChargeBreakdown, float]:
+        """Size a buy so gross value plus all buy-side charges fits the wallet."""
+        budget = capital * (self.position_size_pct / 100)
+        quantity = self.charge_config.max_buy_quantity(budget, price)
+        charges = self.charge_config.calculate_order("BUY", price, quantity)
+        return quantity, charges, quantity * price + charges.total
+
+    def _close_trade(
+        self,
+        *,
+        capital: float,
+        entry_price: float,
+        entry_date: date,
+        entry_qty: int,
+        entry_charges: ChargeBreakdown,
+        exit_price: float,
+        exit_date: date,
+        exit_reason: str,
+        hold_days: int,
+    ) -> tuple[float, BacktestTrade]:
+        exit_charges = self.charge_config.calculate_order("SELL", exit_price, entry_qty)
+        gross_pnl = (exit_price - entry_price) * entry_qty
+        total_charges = entry_charges.total + exit_charges.total
+        net_pnl = gross_pnl - total_charges
+        cash_after = capital + entry_qty * exit_price - exit_charges.total
+        trade = BacktestTrade(
+            symbol=self.symbol,
+            entry_date=entry_date,
+            exit_date=exit_date,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=entry_qty,
+            pnl=net_pnl,
+            pnl_pct=(net_pnl / (entry_price * entry_qty + entry_charges.total) * 100)
+            if entry_qty > 0
+            else 0.0,
+            exit_reason=exit_reason,
+            hold_days=hold_days,
+            metadata={
+                "gross_pnl": gross_pnl,
+                "entry_charges": entry_charges.to_dict(),
+                "exit_charges": exit_charges.to_dict(),
+                "total_charges": total_charges,
+                "charge_config": self.charge_config.to_dict(),
+            },
+        )
+        return cash_after, trade
+
+    def _marked_value(self, cash: float, price: float, quantity: int) -> float:
+        if quantity <= 0:
+            return cash
+        estimated_sell = self.charge_config.calculate_order("SELL", price, quantity)
+        return cash + quantity * price - estimated_sell.total
+
     def run(self) -> BacktestResult:
         """Execute the backtest and return results."""
-        if len(self.candles) < 201:
+        minimum_candles = 150 if self.algorithm == "swing_volume_profile_pullback" else 201
+        if len(self.candles) < minimum_candles:
             return BacktestResult(
                 algorithm_name=self.algorithm,
                 symbol=self.symbol,
                 start_date=self.dates[0] if self.dates else date.today(),
                 end_date=self.dates[-1] if self.dates else date.today(),
                 initial_capital=self.initial_capital,
-                error=f"Insufficient data: {len(self.candles)} candles (need 201+)",
+                error=f"Insufficient data: {len(self.candles)} candles (need {minimum_candles}+)",
             )
 
         if self.algorithm == "rayner_dip_buyer":
             return self._run_rayner()
         elif self.algorithm == "connors_rsi_pullback":
             return self._run_connors()
+        elif self.algorithm == "swing_volume_profile_pullback":
+            return self._run_swing_volume_profile_pullback()
         else:
             return BacktestResult(
                 algorithm_name=self.algorithm,
@@ -206,6 +268,106 @@ class Backtester:
                 initial_capital=self.initial_capital,
                 error=f"Unknown algorithm: {self.algorithm}",
             )
+
+    def _run_swing_volume_profile_pullback(self) -> BacktestResult:
+        """Trade confirmed bullish swings after a pullback into their value area."""
+        states = build_swing_volume_profile_states(
+            self.candles,
+            lookback=150,
+            pivot_window=3,
+            value_area_percent=70,
+            zone_buffer_pct=0.25,
+        )
+        capital = self.initial_capital
+        trades: list[BacktestTrade] = []
+        equity_curve: list[dict] = []
+        position: dict[str, Any] | None = None
+        pending = None
+        max_hold_days = 50
+        target_r = 2.0
+        stop_buffer_pct = 0.5
+
+        def close(price: float, index: int, reason: str) -> None:
+            nonlocal capital, position
+            assert position is not None
+            capital, trade = self._close_trade(
+                capital=capital,
+                entry_price=position["entry_price"],
+                entry_date=position["entry_date"],
+                entry_qty=position["quantity"],
+                entry_charges=position["entry_charges"],
+                exit_price=price,
+                exit_date=self.dates[index],
+                exit_reason=reason,
+                hold_days=index - position["entry_index"] + 1,
+            )
+            trade.metadata.update(position["profile_metadata"])
+            trades.append(trade)
+            position = None
+
+        for index, candle in enumerate(self.candles):
+            if pending is not None:
+                entry_price = self.opens[index]
+                stop = pending.swing_low * (1 - stop_buffer_pct / 100)
+                risk = entry_price - stop
+                if 0 < risk <= entry_price * 0.15:
+                    quantity, entry_charges, debit = self._entry(capital, entry_price)
+                    if quantity > 0:
+                        capital -= debit
+                        position = {
+                            "entry_index": index,
+                            "entry_date": self.dates[index],
+                            "entry_price": entry_price,
+                            "quantity": quantity,
+                            "entry_charges": entry_charges,
+                            "stop": stop,
+                            "target": entry_price + target_r * risk,
+                            "profile_metadata": {
+                                "poc": pending.poc,
+                                "swing_low": pending.swing_low,
+                                "swing_high": pending.swing_high,
+                                "value_area_low": pending.value_area_low,
+                                "value_area_high": pending.value_area_high,
+                                "stop_price": stop,
+                                "target_price": entry_price + target_r * risk,
+                                "target_r": target_r,
+                                "stop_buffer_pct": stop_buffer_pct,
+                                "poc_method": "daily_ohlcv_estimate",
+                            },
+                        }
+                pending = None
+
+            if position is not None:
+                stop = position["stop"]
+                target = position["target"]
+                if self.opens[index] <= stop:
+                    close(self.opens[index], index, "gap_stop")
+                elif self.opens[index] >= target:
+                    close(self.opens[index], index, "gap_target")
+                elif self.lows[index] <= stop:
+                    close(stop, index, "stop_loss")
+                elif self.highs[index] >= target:
+                    close(target, index, f"target_{target_r:g}r")
+                elif index - position["entry_index"] >= max_hold_days:
+                    close(self.closes[index], index, "time_exit")
+
+            if position is None and pending is None and index + 1 < len(self.candles) and states[index].signal:
+                pending = states[index]
+
+            equity_curve.append({
+                "date": str(self.dates[index]),
+                "value": round(self._marked_value(
+                    capital,
+                    self.closes[index],
+                    position["quantity"] if position is not None else 0,
+                ), 2),
+            })
+
+        if position is not None:
+            close(self.closes[-1], len(self.candles) - 1, "backtest_end")
+            if equity_curve:
+                equity_curve[-1]["value"] = round(capital, 2)
+        return self._compute_stats(trades, equity_curve)
 
     # ── Rayner Dip Buyer Backtest ─────────────────────────
 
@@ -226,6 +388,7 @@ class Backtester:
         entry_price = 0.0
         entry_date = None
         entry_qty = 0
+        entry_charges = ChargeBreakdown(side="BUY", turnover=0.0)
         candles_held = 0
         pending_limit = None  # (limit_price, trigger_date_idx)
         pending_exit = False
@@ -243,14 +406,13 @@ class Backtester:
                 if current_low <= limit_price:
                     # Filled! Enter at limit price (or open if it gapped below)
                     fill_price = min(current_open, limit_price) if current_open <= limit_price else limit_price
-                    pos_capital = capital * (self.position_size_pct / 100)
-                    entry_qty = int(pos_capital / fill_price)
+                    entry_qty, entry_charges, entry_debit = self._entry(capital, fill_price)
                     if entry_qty > 0:
                         entry_price = fill_price
                         entry_date = current_date
                         in_trade = True
                         candles_held = 0
-                        capital -= entry_qty * entry_price
+                        capital -= entry_debit
                 pending_limit = None  # Expired either way
 
             # ── Check exits for active trade ──
@@ -261,43 +423,37 @@ class Backtester:
                 stop_price = entry_price * 0.95
                 if current_low <= stop_price:
                     exit_price = stop_price
-                    pnl = (exit_price - entry_price) * entry_qty
-                    capital += entry_qty * exit_price
-                    trades.append(BacktestTrade(
-                        symbol=self.symbol, entry_date=entry_date,
-                        exit_date=current_date, entry_price=entry_price,
-                        exit_price=exit_price, quantity=entry_qty,
-                        pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+                    capital, trade = self._close_trade(
+                        capital=capital, entry_price=entry_price, entry_date=entry_date,
+                        entry_qty=entry_qty, entry_charges=entry_charges,
+                        exit_price=exit_price, exit_date=current_date,
                         exit_reason="stop_loss", hold_days=candles_held,
-                    ))
+                    )
+                    trades.append(trade)
                     in_trade = False
                     pending_exit = False
                 # Pending exit from yesterday's SMA5 crossover
                 elif pending_exit:
                     exit_price = current_open
-                    pnl = (exit_price - entry_price) * entry_qty
-                    capital += entry_qty * exit_price
-                    trades.append(BacktestTrade(
-                        symbol=self.symbol, entry_date=entry_date,
-                        exit_date=current_date, entry_price=entry_price,
-                        exit_price=exit_price, quantity=entry_qty,
-                        pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+                    capital, trade = self._close_trade(
+                        capital=capital, entry_price=entry_price, entry_date=entry_date,
+                        entry_qty=entry_qty, entry_charges=entry_charges,
+                        exit_price=exit_price, exit_date=current_date,
                         exit_reason="sma5_exit", hold_days=candles_held,
-                    ))
+                    )
+                    trades.append(trade)
                     in_trade = False
                     pending_exit = False
                 # Time stop: 20 candles
                 elif candles_held >= 20:
                     exit_price = current_close
-                    pnl = (exit_price - entry_price) * entry_qty
-                    capital += entry_qty * exit_price
-                    trades.append(BacktestTrade(
-                        symbol=self.symbol, entry_date=entry_date,
-                        exit_date=current_date, entry_price=entry_price,
-                        exit_price=exit_price, quantity=entry_qty,
-                        pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+                    capital, trade = self._close_trade(
+                        capital=capital, entry_price=entry_price, entry_date=entry_date,
+                        entry_qty=entry_qty, entry_charges=entry_charges,
+                        exit_price=exit_price, exit_date=current_date,
                         exit_reason="time_stop", hold_days=candles_held,
-                    ))
+                    )
+                    trades.append(trade)
                     in_trade = False
                     pending_exit = False
                 # Check SMA5 exit condition at close
@@ -318,23 +474,19 @@ class Backtester:
                             pending_limit = (limit_price, i)
 
             # ── Equity curve ──
-            portfolio_val = capital
-            if in_trade:
-                portfolio_val += entry_qty * current_close
+            portfolio_val = self._marked_value(capital, current_close, entry_qty if in_trade else 0)
             equity_curve.append({"date": str(current_date), "value": round(portfolio_val, 2)})
 
         # Close any open trade at the end
         if in_trade:
             exit_price = self.closes[-1]
-            pnl = (exit_price - entry_price) * entry_qty
-            capital += entry_qty * exit_price
-            trades.append(BacktestTrade(
-                symbol=self.symbol, entry_date=entry_date,
-                exit_date=self.dates[-1], entry_price=entry_price,
-                exit_price=exit_price, quantity=entry_qty,
-                pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+            capital, trade = self._close_trade(
+                capital=capital, entry_price=entry_price, entry_date=entry_date,
+                entry_qty=entry_qty, entry_charges=entry_charges,
+                exit_price=exit_price, exit_date=self.dates[-1],
                 exit_reason="backtest_end", hold_days=candles_held,
-            ))
+            )
+            trades.append(trade)
 
         return self._compute_stats(trades, equity_curve)
 
@@ -358,6 +510,7 @@ class Backtester:
         entry_price = 0.0
         entry_date = None
         entry_qty = 0
+        entry_charges = ChargeBreakdown(side="BUY", turnover=0.0)
         candles_held = 0
         pending_entry = False  # Signal detected, enter at next open
         cooldown = 0  # Avoid whipsaws
@@ -373,14 +526,13 @@ class Backtester:
 
             # ── Execute pending entry at today's open ──
             if pending_entry and not in_trade:
-                pos_capital = capital * (self.position_size_pct / 100)
-                entry_qty = int(pos_capital / current_open)
+                entry_qty, entry_charges, entry_debit = self._entry(capital, current_open)
                 if entry_qty > 0:
                     entry_price = current_open
                     entry_date = current_date
                     in_trade = True
                     candles_held = 0
-                    capital -= entry_qty * entry_price
+                    capital -= entry_debit
                 pending_entry = False
 
             # ── Check exits ──
@@ -392,15 +544,13 @@ class Backtester:
                     stop_price = entry_price * (1 - cfg.stop_loss_pct / 100)
                     if current_low <= stop_price:
                         exit_price = stop_price
-                        pnl = (exit_price - entry_price) * entry_qty
-                        capital += entry_qty * exit_price
-                        trades.append(BacktestTrade(
-                            symbol=self.symbol, entry_date=entry_date,
-                            exit_date=current_date, entry_price=entry_price,
-                            exit_price=exit_price, quantity=entry_qty,
-                            pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+                        capital, trade = self._close_trade(
+                            capital=capital, entry_price=entry_price, entry_date=entry_date,
+                            entry_qty=entry_qty, entry_charges=entry_charges,
+                            exit_price=exit_price, exit_date=current_date,
                             exit_reason="stop_loss", hold_days=candles_held,
-                        ))
+                        )
+                        trades.append(trade)
                         in_trade = False
                         cooldown = 5
                         continue
@@ -408,15 +558,13 @@ class Backtester:
                 # Time stop
                 if candles_held >= cfg.max_hold_candles:
                     exit_price = current_close
-                    pnl = (exit_price - entry_price) * entry_qty
-                    capital += entry_qty * exit_price
-                    trades.append(BacktestTrade(
-                        symbol=self.symbol, entry_date=entry_date,
-                        exit_date=current_date, entry_price=entry_price,
-                        exit_price=exit_price, quantity=entry_qty,
-                        pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+                    capital, trade = self._close_trade(
+                        capital=capital, entry_price=entry_price, entry_date=entry_date,
+                        entry_qty=entry_qty, entry_charges=entry_charges,
+                        exit_price=exit_price, exit_date=current_date,
                         exit_reason="time_stop", hold_days=candles_held,
-                    ))
+                    )
+                    trades.append(trade)
                     in_trade = False
                     cooldown = 5
                     continue
@@ -424,15 +572,13 @@ class Backtester:
                 # RSI exit
                 if not np.isnan(rsi[i]) and rsi[i] >= cfg.rsi_exit_threshold:
                     exit_price = current_close
-                    pnl = (exit_price - entry_price) * entry_qty
-                    capital += entry_qty * exit_price
-                    trades.append(BacktestTrade(
-                        symbol=self.symbol, entry_date=entry_date,
-                        exit_date=current_date, entry_price=entry_price,
-                        exit_price=exit_price, quantity=entry_qty,
-                        pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+                    capital, trade = self._close_trade(
+                        capital=capital, entry_price=entry_price, entry_date=entry_date,
+                        entry_qty=entry_qty, entry_charges=entry_charges,
+                        exit_price=exit_price, exit_date=current_date,
                         exit_reason="rsi_recovery", hold_days=candles_held,
-                    ))
+                    )
+                    trades.append(trade)
                     in_trade = False
                     cooldown = 5
                     continue
@@ -448,23 +594,19 @@ class Backtester:
                     pending_entry = True  # Enter at tomorrow's open
 
             # ── Equity curve ──
-            portfolio_val = capital
-            if in_trade:
-                portfolio_val += entry_qty * current_close
+            portfolio_val = self._marked_value(capital, current_close, entry_qty if in_trade else 0)
             equity_curve.append({"date": str(current_date), "value": round(portfolio_val, 2)})
 
         # Close any open trade at end
         if in_trade:
             exit_price = self.closes[-1]
-            pnl = (exit_price - entry_price) * entry_qty
-            capital += entry_qty * exit_price
-            trades.append(BacktestTrade(
-                symbol=self.symbol, entry_date=entry_date,
-                exit_date=self.dates[-1], entry_price=entry_price,
-                exit_price=exit_price, quantity=entry_qty,
-                pnl=pnl, pnl_pct=(exit_price / entry_price - 1) * 100,
+            capital, trade = self._close_trade(
+                capital=capital, entry_price=entry_price, entry_date=entry_date,
+                entry_qty=entry_qty, entry_charges=entry_charges,
+                exit_price=exit_price, exit_date=self.dates[-1],
                 exit_reason="backtest_end", hold_days=candles_held,
-            ))
+            )
+            trades.append(trade)
 
         return self._compute_stats(trades, equity_curve)
 
@@ -573,6 +715,9 @@ class Backtester:
         result.profit_factor = float(result.profit_factor)
         result.avg_hold_days = float(result.avg_hold_days)
         result.final_capital = float(result.final_capital)
+        result.total_charges = float(
+            sum(float(t.metadata.get("total_charges", 0.0)) for t in result.trades)
+        )
         for t in result.trades:
             t.entry_price = float(t.entry_price)
             t.exit_price = float(t.exit_price)
@@ -580,4 +725,3 @@ class Backtester:
             t.pnl_pct = float(t.pnl_pct)
 
         return result
-

@@ -1,0 +1,14 @@
+{
+  "workspace": "/var/folders/ch/hw35f29j4fnf5fsl2139342w0000gn/T/algoanalyst-task-b-check9-e71udjsr/AlgoAnalystBackend",
+  "python": "/var/folders/ch/hw35f29j4fnf5fsl2139342w0000gn/T/algoanalyst-backend-verify-3bko9txc/venv/bin/python",
+  "changed_files": [
+    "requirements.txt",
+    "data/streams/websocket_manager.py",
+    "tests/data/conftest.py",
+    "tests/data/ws_fakes.py",
+    "tests/data/test_websocket_subscriptions.py",
+    "tests/data/test_websocket_generations.py",
+    "tests/data/test_websocket_reconnect.py",
+    "tests/data/test_websocket_health.py"
+  ]
+}

@@ -1,7 +1,13 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import type { Algorithm, BacktestRun, BacktestTrade, Stock } from '@/lib/types';
+import { Suspense, useState, useEffect, useRef, useCallback } from 'react';
+import { useSearchParams } from 'next/navigation';
+import type { Algorithm, BacktestHistoryItem, BacktestRun, BacktestSection, BacktestTrade, Stock } from '@/lib/types';
+import FilterBacktestPanel from '@/components/FilterBacktestPanel';
+import FundamentalQueryBacktestPanel from '@/components/FundamentalQueryBacktestPanel';
+import WatchlistBacktestPanel from '@/components/WatchlistBacktestPanel';
+import EnhancedMomentumBacktestPanel from '@/components/EnhancedMomentumBacktestPanel';
+import StockIdentity from '@/components/StockIdentity';
 import {
   getAlgorithms,
   runBacktest,
@@ -10,11 +16,15 @@ import {
   deleteBacktest,
   searchStocks,
 } from '@/lib/api';
+import { deleteFilterBacktest } from '@/lib/filter-api';
+import { usePersistentState } from '@/lib/persistence';
+import { formatStockSymbol, getStockCompanyName } from '@/lib/stock-display';
 
 // ── Algo display names ──────────────────────────────────────
 const ALGO_LABELS: Record<string, string> = {
   connors_rsi_pullback: 'Connors RSI Pullback',
   rayner_dip_buyer: 'Rayner Dip Buyer',
+  swing_volume_profile_pullback: 'Bullish Swing Volume-Profile Pullback',
   scanner_confluence: 'Scanner Confluence',
 };
 
@@ -42,6 +52,9 @@ function exitReasonLabel(reason: string): string {
   const map: Record<string, string> = {
     sma5_exit: 'SMA5 ↑',
     rsi_recovery: 'RSI ↑',
+    gap_stop: 'Gap Stop',
+    gap_target: 'Gap Target',
+    target_2r: '2R Target',
     stop_loss: 'Stop Loss',
     time_stop: 'Time Stop',
     backtest_end: 'End',
@@ -53,21 +66,27 @@ function exitReasonLabel(reason: string): string {
 // COMPONENT
 // ═══════════════════════════════════════════════════════════════
 
-export default function BacktestPage() {
+function BacktestPageContent({ backtestSection }: { backtestSection: Exclude<BacktestSection, 'watchlist'> }) {
   // ── State ──────────────────────────────────────────────
+  const storagePrefix = `workspace.backtest.${backtestSection}`;
   const [algorithms, setAlgorithms] = useState<Algorithm[]>([]);
-  const [history, setHistory] = useState<BacktestRun[]>([]);
-  const [activeRun, setActiveRun] = useState<BacktestRun | null>(null);
+  const [history, setHistory] = useState<BacktestHistoryItem[]>([]);
+  const [activeRun, setActiveRun] = usePersistentState<BacktestRun | null>(`${storagePrefix}.activeRun`, null);
   const [mode, setMode] = useState<'form' | 'processing' | 'results'>('form');
+  const [historyOpen, setHistoryOpen] = usePersistentState(`${storagePrefix}.historyOpen`, true);
+  const [activeHistoryKey, setActiveHistoryKey] = usePersistentState<string | null>(`${storagePrefix}.activeHistoryKey`, null);
+  const [selectedFilterRunId, setSelectedFilterRunId] = usePersistentState<number | null>(`${storagePrefix}.selectedFilterRunId`, null);
+  const [newRunKey, setNewRunKey] = useState(0);
   const [error, setError] = useState('');
 
   // Form state
-  const [selectedAlgo, setSelectedAlgo] = useState('');
-  const [selectedSymbol, setSelectedSymbol] = useState('');
-  const [selectedStockName, setSelectedStockName] = useState('');
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate] = useState('');
-  const [capital, setCapital] = useState('1000000');
+  const [selectedAlgo, setSelectedAlgo] = usePersistentState(`${storagePrefix}.selectedAlgo`, '');
+  const [selectedSymbol, setSelectedSymbol] = usePersistentState(`${storagePrefix}.selectedSymbol`, '');
+  const [selectedStockName, setSelectedStockName] = usePersistentState(`${storagePrefix}.selectedStockName`, '');
+  const [selectedStockSector, setSelectedStockSector] = usePersistentState(`${storagePrefix}.selectedStockSector`, '');
+  const [startDate, setStartDate] = usePersistentState(`${storagePrefix}.startDate`, '');
+  const [endDate, setEndDate] = usePersistentState(`${storagePrefix}.endDate`, '');
+  const [capital, setCapital] = usePersistentState(`${storagePrefix}.capital`, '1000000');
 
   // Stock search
   const [stockQuery, setStockQuery] = useState('');
@@ -78,36 +97,48 @@ export default function BacktestPage() {
   // Chart ref
   const chartRef = useRef<HTMLDivElement>(null);
 
-  // ── Load initial data ──────────────────────────────────
-  useEffect(() => {
-    getAlgorithms()
-      .then((algos) => {
-        // Only show algos that support backtesting (daily candle strategies)
-        const backtestable = algos.filter((a) =>
-          ['connors_rsi_pullback', 'rayner_dip_buyer'].includes(a.name)
-        );
-        setAlgorithms(backtestable);
-        if (backtestable.length > 0) setSelectedAlgo(backtestable[0].name);
-      })
-      .catch(() => {});
-    loadHistory();
-  }, []);
-
   // ── Load history ───────────────────────────────────────
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (section: BacktestSection) => {
     try {
-      const runs = await getBacktestHistory();
+      const runs = await getBacktestHistory(section);
       setHistory(runs);
     } catch {
       /* silent */
     }
   }, []);
 
+  // ── Load initial data ──────────────────────────────────
+  useEffect(() => {
+    getAlgorithms()
+      .then((algos) => {
+        // Only show algos that support backtesting (daily candle strategies)
+        const backtestable = algos.filter((a) =>
+          ['connors_rsi_pullback', 'rayner_dip_buyer', 'swing_volume_profile_pullback'].includes(a.name)
+        );
+        setAlgorithms(backtestable);
+        if (backtestable.length > 0) setSelectedAlgo((current) => current || backtestable[0].name);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getBacktestHistory(backtestSection)
+      .then((runs) => {
+        if (!cancelled) setHistory(runs);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [backtestSection]);
+
   // ── Stock search ───────────────────────────────────────
   const handleStockSearch = (q: string) => {
     setStockQuery(q);
     setSelectedSymbol('');
     setSelectedStockName('');
+    setSelectedStockSector('');
 
     if (searchTimeout.current) clearTimeout(searchTimeout.current);
     if (q.length < 2) {
@@ -129,8 +160,9 @@ export default function BacktestPage() {
 
   const selectStock = (stock: Stock) => {
     setSelectedSymbol(stock.symbol);
-    setSelectedStockName(stock.name);
-    setStockQuery(stock.symbol.replace('-EQ', ''));
+    setSelectedStockName(getStockCompanyName(stock) || '');
+    setSelectedStockSector(stock.sector || '');
+    setStockQuery(formatStockSymbol(stock.symbol));
     setShowStockDropdown(false);
   };
 
@@ -138,6 +170,7 @@ export default function BacktestPage() {
   const handleRunBacktest = async () => {
     if (!selectedAlgo || !selectedSymbol) return;
 
+    setActiveRun(null);
     setMode('processing');
     setError('');
 
@@ -153,10 +186,11 @@ export default function BacktestPage() {
       // Fetch full result
       const result = await getBacktestResult(run_id);
       setActiveRun(result);
+      setActiveHistoryKey(`algorithm-${run_id}`);
       setMode('results');
 
       // Refresh history
-      await loadHistory();
+      await loadHistory('algorithms');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Backtest failed');
       setMode('form');
@@ -164,12 +198,24 @@ export default function BacktestPage() {
   };
 
   // ── Load a historical run ──────────────────────────────
-  const loadRun = async (runId: number) => {
+  const loadRun = async (run: BacktestHistoryItem) => {
+    setActiveHistoryKey(`${run.backtest_type}-${run.id}`);
+    if (run.backtest_type === 'filter') {
+      setSelectedFilterRunId(run.id);
+      setActiveRun(null);
+      setMode('form');
+      setError('');
+      return;
+    }
+
+    setSelectedFilterRunId(null);
+    setActiveRun(null);
     setMode('processing');
     setError('');
     try {
-      const result = await getBacktestResult(runId);
+      const result = await getBacktestResult(run.id);
       setActiveRun(result);
+      setSelectedAlgo(result.algorithm_name);
       setMode('results');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load run');
@@ -178,12 +224,19 @@ export default function BacktestPage() {
   };
 
   // ── Delete a run ───────────────────────────────────────
-  const handleDelete = async (runId: number, e: React.MouseEvent) => {
+  const handleDelete = async (run: BacktestHistoryItem, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await deleteBacktest(runId);
-      setHistory((prev) => prev.filter((r) => r.id !== runId));
-      if (activeRun?.id === runId) {
+      if (run.backtest_type === 'filter') {
+        await deleteFilterBacktest(run.id);
+      } else {
+        await deleteBacktest(run.id);
+      }
+      const historyKey = `${run.backtest_type}-${run.id}`;
+      setHistory((prev) => prev.filter((item) => `${item.backtest_type}-${item.id}` !== historyKey));
+      if (activeHistoryKey === historyKey) {
+        setActiveHistoryKey(null);
+        setSelectedFilterRunId(null);
         setActiveRun(null);
         setMode('form');
       }
@@ -192,9 +245,25 @@ export default function BacktestPage() {
     }
   };
 
+  const startNewBacktest = () => {
+    setActiveHistoryKey(null);
+    setSelectedFilterRunId(null);
+    setActiveRun(null);
+    setMode('form');
+    setError('');
+    setNewRunKey((key) => key + 1);
+  };
+
+  const handleFilterRun = async (runId: number) => {
+    setActiveHistoryKey(`filter-${runId}`);
+    setSelectedFilterRunId(runId);
+    await loadHistory('filters');
+  };
+
   // ── Equity chart (simple canvas) ───────────────────────
   useEffect(() => {
-    if (mode !== 'results' || !activeRun?.equity_curve?.length || !chartRef.current) return;
+    const displayMode = activeRun && mode === 'form' ? 'results' : mode;
+    if (displayMode !== 'results' || !activeRun?.equity_curve?.length || !chartRef.current) return;
 
     const container = chartRef.current;
     // Clear previous
@@ -270,7 +339,7 @@ export default function BacktestPage() {
 
     // Gradient fill
     const lastX = pad.left + plotW;
-    const lastY = pad.top + plotH - ((values[values.length - 1] - minVal) / range) * plotH;
+
     ctx.lineTo(lastX, pad.top + plotH);
     ctx.lineTo(pad.left, pad.top + plotH);
     ctx.closePath();
@@ -291,111 +360,64 @@ export default function BacktestPage() {
     }
   }, [mode, activeRun]);
 
+  const displayMode = activeRun && mode === 'form' ? 'results' : mode;
+  const hasSwingProfile = activeRun?.algorithm_name === 'swing_volume_profile_pullback';
+
   // ═════════════════════════════════════════════════════════
   // RENDER
   // ═════════════════════════════════════════════════════════
 
   return (
     <div className="bt-layout">
-      {/* ── History Sidebar ── */}
-      <aside className="bt-history">
-        <div className="bt-history-header">
-          <span className="bt-history-title">History</span>
-          <button
-            className="bt-new-btn"
-            onClick={() => {
-              setActiveRun(null);
-              setMode('form');
-              setError('');
-            }}
-          >
-            + New
-          </button>
-        </div>
-        <div className="bt-history-list">
-          {history.length === 0 && (
-            <div className="empty-state" style={{ padding: '32px 16px' }}>
-              <div className="empty-state-icon">🧪</div>
-              <div className="empty-state-text">No backtests yet</div>
-              <div className="empty-state-sub">Run your first backtest</div>
-            </div>
-          )}
-          {history.map((run) => (
-            <div
-              key={run.id}
-              className={`bt-history-item ${activeRun?.id === run.id ? 'active' : ''}`}
-              onClick={() => loadRun(run.id)}
-            >
-              <div className="bt-history-item-algo">
-                {ALGO_LABELS[run.algorithm_name] || run.algorithm_name}
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span className="bt-history-item-symbol">
-                  {run.stock_symbol.replace('-EQ', '')}
-                </span>
-                <button
-                  className="bt-history-item-delete"
-                  title="Delete"
-                  onClick={(e) => handleDelete(run.id, e)}
-                >
-                  ✕
-                </button>
-              </div>
-              <div className="bt-history-item-meta">
-                <span className="bt-history-item-date">{fmtDate(run.created_at)}</span>
-                <span
-                  className="bt-history-item-return"
-                  style={{
-                    color:
-                      run.status === 'failed'
-                        ? 'var(--text-tertiary)'
-                        : (run.total_return_pct ?? 0) >= 0
-                        ? 'var(--color-profit)'
-                        : 'var(--color-loss)',
-                  }}
-                >
-                  {run.status === 'failed'
-                    ? 'Failed'
-                    : run.total_return_pct != null
-                    ? `${run.total_return_pct >= 0 ? '+' : ''}${fmt(run.total_return_pct)}%`
-                    : '—'}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </aside>
-
-      {/* ── Main Panel ── */}
+        {/* ── Main Panel ── */}
       <div className="bt-main">
+        <header className="bt-section-header">
+          <h1 className="bt-section-title">
+            {backtestSection === 'algorithms' ? 'Algorithm backtesting' : 'Filter combination backtesting'}
+          </h1>
+        </header>
+        {backtestSection === 'filters' ? (
+          <FilterBacktestPanel
+            key={`filter-panel-${newRunKey}`}
+            onRun={handleFilterRun}
+            onBatchRun={() => loadHistory('filters')}
+            loadRunId={selectedFilterRunId}
+          />
+        ) : (
+          <div className="bt-workspace-grid">
+            <aside className="bt-algorithm-sidebar" aria-label="Algorithms">
+              <div className="bt-filter-sidebar-header">
+                <span className="bt-filter-sidebar-title">Algorithms</span>
+                <span className="bt-filter-sidebar-count">{algorithms.length}</span>
+              </div>
+              <div className="bt-algorithm-list">
+                {algorithms.map((algorithm) => (
+                  <button
+                    key={algorithm.name}
+                    type="button"
+                    className={`bt-algorithm-item ${selectedAlgo === algorithm.name ? 'is-selected' : ''}`}
+                    onClick={() => {
+                      setSelectedAlgo(algorithm.name);
+                      setActiveRun(null);
+                      setActiveHistoryKey(null);
+                      setMode('form');
+                      setError('');
+                    }}
+                  >
+                    <strong>{algorithm.display_name || ALGO_LABELS[algorithm.name] || algorithm.name}</strong>
+                    <span>{algorithm.strategy_type}</span>
+                    <small>{algorithm.description}</small>
+                  </button>
+                ))}
+              </div>
+            </aside>
+            <div className="bt-workspace-content">
         {error && <div className="bt-error">{error}</div>}
 
         {/* MODE: Form */}
-        {mode === 'form' && (
+        {displayMode === 'form' && (
           <div className="bt-form-container">
-            <h1 className="bt-form-title">Run Backtest</h1>
-            <p className="bt-form-subtitle">
-              Test trading algorithms against historical data
-            </p>
-
             <div className="bt-form">
-              {/* Algorithm */}
-              <div className="bt-field">
-                <label className="bt-field-label" htmlFor="bt-algo">Algorithm</label>
-                <select
-                  id="bt-algo"
-                  className="bt-field-select"
-                  value={selectedAlgo}
-                  onChange={(e) => setSelectedAlgo(e.target.value)}
-                >
-                  {algorithms.map((a) => (
-                    <option key={a.name} value={a.name}>
-                      {a.display_name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
               {/* Stock search */}
               <div className="bt-field">
                 <label className="bt-field-label">Stock</label>
@@ -411,9 +433,9 @@ export default function BacktestPage() {
                     autoComplete="off"
                   />
                   {selectedSymbol && (
-                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-                      Selected: <strong style={{ color: 'var(--accent-secondary)' }}>{selectedSymbol.replace('-EQ', '')}</strong>
-                      {selectedStockName && ` — ${selectedStockName}`}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                      Selected: <StockIdentity symbol={selectedSymbol} name={selectedStockName} sector={selectedStockSector} />
+                      {' · Sector: '}{selectedStockSector || '—'}
                     </div>
                   )}
                   {showStockDropdown && stockResults.length > 0 && (
@@ -422,11 +444,10 @@ export default function BacktestPage() {
                         <div
                           key={s.id}
                           className="bt-stock-option"
-                          onMouseDown={() => selectStock(s)}
                         >
                           <div>
-                            <span className="bt-stock-option-sym">{s.symbol.replace('-EQ', '')}</span>
-                            <span className="bt-stock-option-name" style={{ marginLeft: '8px' }}>{s.name}</span>
+                            <StockIdentity className="bt-stock-option-identity" symbol={s.symbol} name={s.name} company_name={s.company_name} sector={s.sector} close={s.latest_price ?? s.last_price ?? null} market_cap_cr={s.market_cap_cr} as_of_date={s.price_date} />
+                            <small className="bt-stock-option-name" style={{ display: 'block' }}>Sector: {s.sector || '—'}</small>
                           </div>
                           {s.latest_price ? (
                             <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
@@ -435,6 +456,7 @@ export default function BacktestPage() {
                           ) : (
                             <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>No data</span>
                           )}
+                          <button type="button" className="bt-stock-option-select" onMouseDown={(event) => event.preventDefault()} onClick={() => selectStock(s)}>Use stock</button>
                         </div>
                       ))}
                     </div>
@@ -491,7 +513,7 @@ export default function BacktestPage() {
         )}
 
         {/* MODE: Processing */}
-        {mode === 'processing' && (
+        {displayMode === 'processing' && (
           <div className="bt-processing">
             <div className="bt-processing-spinner" />
             <div className="bt-processing-text">Running Backtest...</div>
@@ -502,14 +524,15 @@ export default function BacktestPage() {
         )}
 
         {/* MODE: Results */}
-        {mode === 'results' && activeRun && (
+        {displayMode === 'results' && activeRun && (
           <div>
             {/* Header */}
             <div className="bt-results-header">
               <h1 className="bt-results-title">
                 {ALGO_LABELS[activeRun.algorithm_name] || activeRun.algorithm_name}{' '}
-                — {activeRun.stock_symbol.replace('-EQ', '')}
+                — <StockIdentity className="bt-results-stock-identity" symbol={activeRun.stock_symbol} name={activeRun.stock_name} company_name={activeRun.company_name} sector={activeRun.sector} />
               </h1>
+              <p className="bt-results-meta-item">Symbol: {activeRun.stock_symbol.replace('-EQ', '')} · Sector: {activeRun.sector || '—'}</p>
               <div className="bt-results-meta">
                 <span className="bt-results-meta-item">
                   📅 <strong>{fmtDate(activeRun.start_date)}</strong> → <strong>{fmtDate(activeRun.end_date)}</strong>
@@ -598,6 +621,10 @@ export default function BacktestPage() {
                 <div className="bt-secondary-stat-label">Final Capital</div>
                 <div className="bt-secondary-stat-value">{fmtCurrency(activeRun.final_capital)}</div>
               </div>
+              <div className="bt-secondary-stat">
+                <div className="bt-secondary-stat-label">Trading Charges</div>
+                <div className="bt-secondary-stat-value">{fmtCurrency(activeRun.total_charges ?? 0)}</div>
+              </div>
             </div>
 
             {/* Equity Curve */}
@@ -624,7 +651,9 @@ export default function BacktestPage() {
                         <th>Exit</th>
                         <th>Entry ₹</th>
                         <th>Exit ₹</th>
+                        {hasSwingProfile && <><th>Swing low</th><th>Swing high</th><th>POC</th><th>Value-area low</th><th>Value-area high</th><th>Stop</th><th>Target</th></>}
                         <th>Qty</th>
+                        <th>Charges</th>
                         <th>P&L</th>
                         <th>P&L %</th>
                         <th>Hold</th>
@@ -646,7 +675,11 @@ export default function BacktestPage() {
                           <td style={{ fontFamily: 'JetBrains Mono, monospace' }}>
                             {fmt(t.exit_price)}
                           </td>
+                          {hasSwingProfile && <><td>{fmt(Number(t.metadata?.swing_low))}</td><td>{fmt(Number(t.metadata?.swing_high))}</td><td>{fmt(Number(t.metadata?.poc))}</td><td>{fmt(Number(t.metadata?.value_area_low))}</td><td>{fmt(Number(t.metadata?.value_area_high))}</td><td>{fmt(Number(t.metadata?.stop_price))}</td><td>{fmt(Number(t.metadata?.target_price))}</td></>}
                           <td>{t.quantity}</td>
+                          <td style={{ fontFamily: 'JetBrains Mono, monospace' }}>
+                            {t.metadata?.total_charges != null ? fmtCurrency(Number(t.metadata.total_charges)) : '—'}
+                          </td>
                           <td
                             style={{
                               fontFamily: 'JetBrains Mono, monospace',
@@ -680,7 +713,129 @@ export default function BacktestPage() {
             )}
           </div>
         )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── History Sidebar ── */}
+      <div className={`bt-history-shell ${historyOpen ? 'is-open' : 'is-collapsed'}`}>
+        <aside id="backtest-history-drawer" className="bt-history">
+          <div className="bt-history-header">
+            <div>
+              <span className="bt-history-title">History</span>
+              <span className="bt-history-context">
+                {backtestSection === 'algorithms' ? 'Algorithms' : 'Filter combinations'}
+              </span>
+            </div>
+            <div className="bt-history-actions">
+              <button className="bt-new-btn" onClick={startNewBacktest}>
+                + New
+              </button>
+              <button
+                className="bt-history-hide-btn"
+                type="button"
+                aria-label="Hide backtest history"
+                title="Hide history"
+                onClick={() => setHistoryOpen(false)}
+              >
+                →
+              </button>
+            </div>
+          </div>
+          <div className="bt-history-list">
+            {history.length === 0 && (
+              <div className="empty-state" style={{ padding: '32px 16px' }}>
+                <div className="empty-state-icon">🧪</div>
+                <div className="empty-state-text">No backtests yet</div>
+                <div className="empty-state-sub">
+                  Run your first {backtestSection === 'algorithms' ? 'algorithm' : 'filter'} backtest
+                </div>
+              </div>
+            )}
+            {history.map((run) => {
+              const historyKey = `${run.backtest_type}-${run.id}`;
+              const label = run.backtest_type === 'algorithm'
+                ? ALGO_LABELS[run.display_name] || run.display_name
+                : run.display_name;
+              return (
+                <div
+                  key={historyKey}
+                  className={`bt-history-item ${activeHistoryKey === historyKey ? 'active' : ''}`}
+                  onClick={() => loadRun(run)}
+                >
+                  <div className="bt-history-item-algo">{label}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div>
+                      <StockIdentity className="bt-history-stock-identity" symbol={run.stock_symbol} name={run.stock_name} company_name={run.company_name} sector={run.sector} />
+                      <small style={{ display: 'block', marginTop: 3, color: 'var(--text-tertiary)' }}>Sector: {run.sector || '—'}</small>
+                    </div>
+                    <button
+                      className="bt-history-item-delete"
+                      title="Delete"
+                      onClick={(e) => handleDelete(run, e)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="bt-history-item-meta">
+                    <span className="bt-history-item-date">
+                      {run.backtest_type === 'algorithm' ? 'Algorithm' : 'Filter'} · {fmtDate(run.created_at)}
+                    </span>
+                    <span
+                      className="bt-history-item-return"
+                      style={{
+                        color:
+                          run.status === 'failed'
+                            ? 'var(--text-tertiary)'
+                            : (run.total_return_pct ?? 0) >= 0
+                            ? 'var(--color-profit)'
+                            : 'var(--color-loss)',
+                      }}
+                    >
+                      {run.status === 'failed'
+                        ? 'Failed'
+                        : run.total_return_pct != null
+                        ? `${run.total_return_pct >= 0 ? '+' : ''}${fmt(run.total_return_pct)}%`
+                        : '—'}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+        {!historyOpen && (
+          <button
+            className="bt-history-toggle"
+            type="button"
+            aria-controls="backtest-history-drawer"
+            aria-expanded={historyOpen}
+            onClick={() => setHistoryOpen(true)}
+          >
+            ← <span>History</span>
+          </button>
+        )}
       </div>
     </div>
+  );
+}
+
+function BacktestPageRoute() {
+  const searchParams = useSearchParams();
+  const requestedSection = searchParams.get('section');
+  if (requestedSection === 'watchlist') return <WatchlistBacktestPanel />;
+  if (requestedSection === 'fundamentals') return <FundamentalQueryBacktestPanel />;
+  if (requestedSection === 'enhanced-momentum') return <EnhancedMomentumBacktestPanel />;
+  const backtestSection: Exclude<BacktestSection, 'watchlist'> = requestedSection === 'filters' ? 'filters' : 'algorithms';
+
+  return <BacktestPageContent key={backtestSection} backtestSection={backtestSection} />;
+}
+
+export default function BacktestPage() {
+  return (
+    <Suspense fallback={<div className="bt-page-loading" aria-label="Loading backtest workspace" />}>
+      <BacktestPageRoute />
+    </Suspense>
   );
 }

@@ -55,10 +55,13 @@ class Stock:
     industry: str = ""                  # NSE industry classification
     market_cap_cr: float = 0.0          # Market cap in crores
     lot_size: int = 1                   # F&O lot size (1 for equity)
+    instrument_type: str = ""            # SmartAPI instrument type (e.g. AMXIDX)
 
     @property
     def trading_symbol(self) -> str:
         """SmartAPI trading symbol format."""
+        if self.exchange == Exchange.BSE:
+            return self.symbol
         return f"{self.symbol}-{self.series}"
 
     def __str__(self) -> str:
@@ -316,11 +319,19 @@ class OrderResult:
     order_id: str = ""                  # Internal order ID
     broker_order_id: str = ""           # Broker's order ID
     status: OrderStatus = OrderStatus.CREATED
+    # Quantity sent to the broker. For a live order this is known at
+    # placement; filled_qty/avg_fill_price are NOT — they stay 0 until a
+    # fill is confirmed. A placement acknowledgement is not a fill.
+    placed_qty: int = 0
     filled_qty: int = 0
     avg_fill_price: float = 0.0
     message: str = ""
     is_paper: bool = False
     timestamp: datetime = field(default_factory=lambda: datetime.now(IST))
+    # DUAL mode: outcome of the live (broker) leg. The top-level fields
+    # describe the paper leg; a rejected live leg is visible here instead
+    # of being hidden behind a successful paper fill.
+    live_leg: "OrderResult | None" = None
 
     @property
     def slippage(self) -> float:
@@ -496,4 +507,3 @@ class TechnicalIndicators:
             "support_level": self.support_level, "resistance_level": self.resistance_level,
             "high_52w": self.high_52w, "low_52w": self.low_52w,
         }
-

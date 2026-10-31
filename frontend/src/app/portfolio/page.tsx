@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getPortfolioSummary, getPnL, getPositions } from '@/lib/api';
 import type { PortfolioSummary, DailyPnL, Position } from '@/lib/types';
+import StockIdentity from '@/components/StockIdentity';
 
 function fmt(n: number): string {
   if (Math.abs(n) >= 1e7) return `₹${(n / 1e7).toFixed(2)} Cr`;
@@ -40,10 +41,11 @@ export default function PortfolioPage() {
       <div className="card" style={{marginBottom:20}}>
         <div className="card-header"><span className="card-title">Positions</span></div>
         {positions.length>0?(
-          <table className="data-table"><thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>Current</th><th>P&amp;L</th></tr></thead>
+          <table className="data-table"><thead><tr><th>Stock</th><th>Sector</th><th>Qty</th><th>Avg</th><th>Current</th><th>P&amp;L</th></tr></thead>
           <tbody>{positions.map(p=>(
             <tr key={p.id} onClick={()=>router.push(`/stocks/${p.symbol}`)}>
-              <td style={{fontWeight:600}}>{p.symbol}</td><td>{p.quantity}</td>
+              <td><StockIdentity symbol={p.symbol} name={p.name} company_name={p.company_name} /></td>
+              <td>{p.sector || '—'}</td><td>{p.quantity}</td>
               <td style={{fontFamily:"'JetBrains Mono',monospace"}}>₹{p.avg_buy_price?.toFixed(2)}</td>
               <td style={{fontFamily:"'JetBrains Mono',monospace"}}>₹{p.current_price?.toFixed(2)}</td>
               <td style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600,color:p.unrealized_pnl>=0?'var(--color-profit)':'var(--color-loss)'}}>{fmt(p.unrealized_pnl)}</td>

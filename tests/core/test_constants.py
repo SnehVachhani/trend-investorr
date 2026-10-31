@@ -1,4 +1,4 @@
-"""Tests for core.constants — enums, market hours, timezone, NSE calendar."""
+"""Tests for core.constants — enums, market hours, timezone."""
 
 import pytest
 from datetime import time, datetime, date
@@ -19,8 +19,7 @@ from core.constants import (
     FeedMode,
     CandleInterval,
     AuditEventType,
-    is_nse_trading_day,
-    get_nse_trading_days,
+    NSE_HOLIDAYS_2026,
 )
 
 
@@ -66,53 +65,11 @@ class TestEnums:
         assert actions == {"BUY", "SELL", "SKIP", "HOLD"}
 
 
-class TestNSETradingCalendar:
-    def test_republic_day_is_not_trading_day(self):
-        """Republic Day (Jan 26) is a national holiday — NSE is closed."""
-        assert is_nse_trading_day(date(2026, 1, 26)) is False
+class TestNSEHolidays:
+    def test_holidays_are_parseable_dates(self):
+        for date_str in NSE_HOLIDAYS_2026:
+            parsed = date.fromisoformat(date_str)
+            assert parsed.year == 2026, f"Holiday {date_str} is not in 2026"
 
-    def test_regular_weekday_is_trading_day(self):
-        """A normal Monday should be a trading day."""
-        # 2026-06-15 is a Monday
-        assert is_nse_trading_day(date(2026, 6, 15)) is True
-
-    def test_weekend_is_not_trading_day(self):
-        """Saturdays and Sundays are never trading days."""
-        # 2026-06-14 is a Sunday
-        assert is_nse_trading_day(date(2026, 6, 14)) is False
-
-    def test_accepts_iso_string(self):
-        """Function should accept ISO date strings as well as date objects."""
-        assert is_nse_trading_day("2026-01-26") is False
-        assert is_nse_trading_day("2026-06-15") is True
-
-    def test_get_trading_days_returns_sorted_dates(self):
-        """get_nse_trading_days returns a sorted list of date objects."""
-        days = get_nse_trading_days(date(2026, 1, 1), date(2026, 1, 31))
-        assert len(days) > 0
-        assert all(isinstance(d, date) for d in days)
-        assert days == sorted(days)
-
-    def test_get_trading_days_excludes_weekends(self):
-        """No Saturday or Sunday should appear in the result."""
-        days = get_nse_trading_days(date(2026, 1, 1), date(2026, 12, 31))
-        for d in days:
-            assert d.weekday() < 5, f"{d} is a weekend day"
-
-    def test_get_trading_days_works_across_years(self):
-        """Calendar should work for historical years, not just 2026."""
-        days_2020 = get_nse_trading_days(date(2020, 1, 1), date(2020, 12, 31))
-        assert len(days_2020) > 200  # ~248 trading days per year
-        assert len(days_2020) < 260
-
-    def test_known_missing_holidays_are_excluded(self):
-        """The dates that were missing from the old hardcoded list should be holidays."""
-        # 2026-03-26 and 2026-05-28 were returning 0 candles for ALL stocks
-        # These should NOT be trading days
-        mar26 = is_nse_trading_day(date(2026, 3, 26))
-        may28 = is_nse_trading_day(date(2026, 5, 28))
-        # At least one of these should be a holiday (confirmed by API returning 0 candles)
-        assert not mar26 or not may28, (
-            "At least one of 2026-03-26 / 2026-05-28 should be a holiday "
-            "based on API evidence"
-        )
+    def test_republic_day_present(self):
+        assert "2026-01-26" in NSE_HOLIDAYS_2026

@@ -1,0 +1,7 @@
+{
+  "scenario": "BUY request in flight; square-off entry-lock acquisition times out",
+  "squareoff_live_error": null,
+  "confirmation_flat_while_buy_in_flight": true,
+  "later_buy_status": "PLACED",
+  "working_BUYs_after_squareoff": 1
+}

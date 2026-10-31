@@ -43,6 +43,31 @@ class Settings(BaseSettings):
     ANGEL_PASSWORD: str = ""
     ANGEL_TOTP_SECRET: str = ""
 
+    # ── Upstox Fundamentals (read-only Analytics Token) ────
+    # The token is only used to retrieve GET endpoints.  It is copied into
+    # the encrypted vault on first boot when present in .env.
+    UPSTOX_ANALYTICS_TOKEN: str = ""
+    UPSTOX_API_BASE_URL: str = "https://api.upstox.com/v2"
+    UPSTOX_INSTRUMENTS_URL: str = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+    UPSTOX_HTTP_TIMEOUT_SECONDS: float = 20.0
+    UPSTOX_MAX_RETRIES: int = 3
+    UPSTOX_MAX_REQUESTS_PER_RUN: int = 2000
+    UPSTOX_REQUESTS_PER_MINUTE: int = 500
+    UPSTOX_REQUESTS_PER_30_MINUTES: int = 2000
+    UPSTOX_MAX_BATCHES_PER_CYCLE: int = 24
+    UPSTOX_BATCH_INTERVAL_MINUTES: int = 30
+    UPSTOX_MAX_STOCKS_PER_RUN: int = 0
+    UPSTOX_SYNC_HOUR: int = 16
+    UPSTOX_SYNC_MINUTE: int = 20
+    UPSTOX_WEEKLY_SYNC_HOUR: int = 0
+    UPSTOX_WEEKLY_SYNC_MINUTE: int = 0
+    UPSTOX_PROFILE_REFRESH_DAYS: int = 30
+    UPSTOX_STATEMENT_REFRESH_DAYS: int = 7
+    UPSTOX_RATIO_REFRESH_DAYS: int = 1
+    UPSTOX_SHAREHOLDING_REFRESH_DAYS: int = 7
+    UPSTOX_CORPORATE_ACTION_REFRESH_DAYS: int = 1
+    UPSTOX_COMPETITOR_REFRESH_DAYS: int = 30
+
     # ── Google Gemini AI (optional) ──────────────────────
     GEMINI_API_KEY: str = ""
 
@@ -106,6 +131,11 @@ class Settings(BaseSettings):
             self.ANGEL_PASSWORD,
             self.ANGEL_TOTP_SECRET,
         ])
+
+    @property
+    def has_upstox_analytics_token(self) -> bool:
+        """Whether the read-only Upstox fundamentals pipeline is configured."""
+        return bool(self.UPSTOX_ANALYTICS_TOKEN)
 
     @property
     def has_gemini_key(self) -> bool:

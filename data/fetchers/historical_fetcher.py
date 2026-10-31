@@ -6,7 +6,7 @@ indicator calculation, and volume average computation.
 
 SmartAPI limits:
     - Max 2000 candles per request
-    - Max 10 requests/second (handled by rate limiter)
+    - Max 3 requests/second, 180/minute, and 5000/hour per client code
     - Historical data available for ~2 years
 
 Raises:
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Any
 
 from loguru import logger
@@ -30,6 +31,7 @@ from core.exceptions import (
     InstrumentNotFoundError,
     SessionExpiredError,
 )
+from data.ohlcv import is_valid_ohlcv
 from data.models.market_data import Candle
 
 
@@ -59,6 +61,11 @@ class HistoricalFetcher:
 
     # SmartAPI limit per request
     MAX_CANDLES_PER_REQUEST = 2000
+    # The hourly provider quota is the binding limit for long backfills:
+    # 5000 requests/hour = 0.72 seconds/request.  This is intentionally
+    # slower than the per-second limit so a sustained sync does not exhaust
+    # the hourly quota and get trapped in repeated rate-limit retries.
+    MIN_REQUEST_INTERVAL = 0.72
 
     def __init__(self, session: Any):
         """
@@ -66,6 +73,25 @@ class HistoricalFetcher:
             session: SmartAPISession instance for authenticated API calls.
         """
         self._session = session
+        self._rate_limit_lock = Lock()
+        self._next_request_at = 0.0
+
+    def _wait_for_rate_limit(self) -> None:
+        """Serialize historical request starts across concurrent workers."""
+        with self._rate_limit_lock:
+            now = time.monotonic()
+            delay = self._next_request_at - now
+            if delay > 0:
+                time.sleep(delay)
+            self._next_request_at = time.monotonic() + self.MIN_REQUEST_INTERVAL
+
+    def _defer_after_rate_limit(self, retry_after: float) -> None:
+        """Pause all workers after the provider reports a rate limit."""
+        with self._rate_limit_lock:
+            self._next_request_at = max(
+                self._next_request_at,
+                time.monotonic() + retry_after,
+            )
 
     def get_candles(
         self,
@@ -103,7 +129,6 @@ class HistoricalFetcher:
         end: datetime,
         interval: CandleInterval = CandleInterval.ONE_DAY,
         exchange: Exchange = Exchange.NSE,
-        failure_collector: list[dict] | None = None,
     ) -> list[Candle]:
         """
         Fetch candle data for a specific date range.
@@ -118,9 +143,6 @@ class HistoricalFetcher:
             end: End datetime (inclusive).
             interval: Candle interval.
             exchange: Stock exchange.
-            failure_collector: Optional list to collect failed chunk metadata.
-                If provided, failed chunks append {start, end, error} dicts.
-                Backward compatible — existing callers don't pass this.
 
         Returns:
             List of Candle dataclasses, sorted by timestamp ascending.
@@ -129,6 +151,7 @@ class HistoricalFetcher:
             DataFetchError: If the API call fails after retries.
         """
         all_candles: list[Candle] = []
+        chunks: list[tuple[datetime, datetime]] = []
         current_start = start
 
         # Calculate chunk size based on interval
@@ -136,34 +159,54 @@ class HistoricalFetcher:
 
         while current_start < end:
             current_end = min(current_start + timedelta(days=chunk_days), end)
-
-            try:
-                chunk = self._fetch_chunk(
-                    symbol=symbol,
-                    token=token,
-                    start=current_start,
-                    end=current_end,
-                    interval=interval,
-                    exchange=exchange,
-                )
-                all_candles.extend(chunk)
-            except DataFetchError as e:
-                # Log and continue with next chunk — partial data is better than none
-                logger.warning(
-                    f"Failed to fetch chunk for {symbol} "
-                    f"({current_start.date()} to {current_end.date()}): {e}"
-                )
-                if failure_collector is not None:
-                    failure_collector.append({
-                        "start": current_start.isoformat(),
-                        "end": current_end.isoformat(),
-                        "error": str(e),
-                    })
-
+            chunks.append((current_start, current_end))
             current_start = current_end + timedelta(minutes=1)
 
-            # Brief pause between chunks to respect rate limits
-            time.sleep(0.1)  # courtesy delay between chunks
+        failed_chunks: list[tuple[datetime, datetime, Exception]] = []
+
+        def _fetch_chunks(
+            pending: list[tuple[datetime, datetime]],
+        ) -> list[tuple[datetime, datetime, Exception]]:
+            failed: list[tuple[datetime, datetime, Exception]] = []
+            for chunk_start, chunk_end in pending:
+                try:
+                    chunk = self._fetch_chunk(
+                        symbol=symbol,
+                        token=token,
+                        start=chunk_start,
+                        end=chunk_end,
+                        interval=interval,
+                        exchange=exchange,
+                    )
+                    all_candles.extend(chunk)
+                except (DataFetchError, RateLimitError) as e:
+                    failed.append((chunk_start, chunk_end, e))
+                    logger.warning(
+                        f"Failed to fetch chunk for {symbol} "
+                        f"({chunk_start.date()} to {chunk_end.date()}): {e}"
+                    )
+
+                # Brief pause between chunks to respect rate limits.
+                time.sleep(0.1)
+            return failed
+
+        failed_chunks = _fetch_chunks(chunks)
+
+        # A network interruption can affect a whole range after the per-request
+        # retries are exhausted. Retry only those failed chunks so a transient
+        # outage does not permanently turn a stock into a partial backfill.
+        for retry_round in range(1, 3):
+            if not failed_chunks:
+                break
+            time.sleep(2 ** retry_round)
+            failed_chunks = _fetch_chunks(
+                [(chunk_start, chunk_end) for chunk_start, chunk_end, _ in failed_chunks]
+            )
+
+        if failed_chunks:
+            # Do not return partial data: the caller would update coverage with
+            # only the first/last successful candle and hide the missing range.
+            raise failed_chunks[0][2]
 
         # Deduplicate by timestamp (overlapping chunks may have dupes)
         seen_timestamps: set[str] = set()
@@ -222,6 +265,7 @@ class HistoricalFetcher:
         for attempt in range(1, max_retries + 1):
             try:
                 api = self._session.get_api()
+                self._wait_for_rate_limit()
                 response = api.getCandleData(params)
 
                 if not response:
@@ -265,6 +309,7 @@ class HistoricalFetcher:
 
             except RateLimitError as e:
                 logger.warning(f"Rate limited for {symbol} — waiting {e.retry_after}s")
+                self._defer_after_rate_limit(e.retry_after)
                 time.sleep(e.retry_after)
                 last_error = e
 
@@ -272,18 +317,43 @@ class HistoricalFetcher:
                 raise  # Let caller handle re-auth
 
             except Exception as e:
+                error_message = str(e)
+                error_lower = error_message.lower()
+                if (
+                    "exceeding access rate" in error_lower
+                    or ("rate" in error_lower and "limit" in error_lower)
+                    or "too many request" in error_lower
+                ):
+                    last_error = RateLimitError(
+                        f"Rate limited on historical data for {symbol}",
+                        retry_after=2.0,
+                        symbol=symbol,
+                    )
+                    logger.warning(
+                        f"Rate limited for {symbol} — waiting {last_error.retry_after}s"
+                    )
+                    self._defer_after_rate_limit(last_error.retry_after)
+                    if attempt < max_retries:
+                        time.sleep(last_error.retry_after)
+                    continue
+
+                # SDK/HTTP exception strings can include request headers or
+                # authenticated URLs. Keep the failure class for diagnostics,
+                # but never persist or log the raw provider exception text.
                 last_error = DataFetchError(
-                    f"Historical fetch error for {symbol}: {e}",
+                    f"Historical fetch error for {symbol} ({type(e).__name__})",
                     details={
                         "symbol": symbol,
                         "attempt": attempt,
                         "error": type(e).__name__,
-                        "message": str(e),
                     },
                 )
                 logger.warning(
-                    f"Historical fetch failed for {symbol} "
-                    f"(attempt {attempt}/{max_retries}): {e}"
+                    "Historical fetch failed for {} (attempt {}/{}): {}",
+                    symbol,
+                    attempt,
+                    max_retries,
+                    type(e).__name__,
                 )
 
                 if attempt < max_retries:
@@ -304,29 +374,43 @@ class HistoricalFetcher:
         SmartAPI format: [[timestamp, open, high, low, close, volume], ...]
         """
         candles: list[Candle] = []
+        invalid_count = 0
 
         for row in raw_data:
             try:
                 if not row or len(row) < 6:
+                    invalid_count += 1
                     continue
 
                 timestamp = datetime.strptime(str(row[0]), "%Y-%m-%dT%H:%M:%S%z")
+                open_ = float(row[1])
+                high = float(row[2])
+                low = float(row[3])
+                close = float(row[4])
+                volume = int(row[5])
+                if not is_valid_ohlcv(open_, high, low, close, volume):
+                    invalid_count += 1
+                    continue
                 candle = Candle(
                     symbol=symbol,
                     timestamp=timestamp,
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=int(row[5]),
+                    open=open_,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=volume,
                     interval=interval,
                 )
                 candles.append(candle)
 
-            except (ValueError, IndexError, TypeError) as e:
+            except (ValueError, IndexError, TypeError, OverflowError) as e:
                 # Skip malformed candle data, log at debug level
+                invalid_count += 1
                 logger.debug(f"Skipping malformed candle for {symbol}: {row} — {e}")
                 continue
+
+        if invalid_count:
+            logger.warning(f"Skipped {invalid_count} invalid OHLCV candle(s) for {symbol}")
 
         return candles
 

@@ -1,0 +1,28 @@
+{
+  "migration_statements": 6,
+  "migrations_applied_twice": true,
+  "concurrent_admission": [
+    "queued",
+    409
+  ],
+  "job_count": 1,
+  "unique_violation_maps_to_busy": true,
+  "stale_settlement": "failed",
+  "late_status_write": "rejected",
+  "late_result_save": "rejected",
+  "run_count": 0,
+  "valid_result_saved": true,
+  "valid_completion": "written",
+  "repeat_save_before_completion": {
+    "first_run": 2,
+    "second_run": 2
+  },
+  "cross_worker_identity_reuses_job": true,
+  "identity_parameter_mismatch": 422,
+  "same_identity_busy_guard_interleaving": [
+    "0b095f48dbe44371a9ddf651f72b719d",
+    409
+  ],
+  "upgrade_index_is_unique": false,
+  "upgrade_save_error": "Execute returning failed: there is no unique or exclusion constraint matching the ON CONFLICT specification\n | Details: {'query': \"\\n        WITH owner AS (\\n            UPDATE enhanced_momentum_backtest_jobs\\n            SET heartbeat_at = NOW()\\n            WHERE job_id = %s AND worker_id = %s AND status = 'running'\\n            RET\", 'error': 'there is no unique or exclusion constraint matching the ON CONFLICT specification\\n'}"
+}

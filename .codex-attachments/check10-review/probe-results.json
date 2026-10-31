@@ -1,0 +1,45 @@
+[
+  {
+    "case": "accepted but reply empty-dict",
+    "statuses": [
+      "UNKNOWN",
+      "REJECTED"
+    ],
+    "submissions": 1
+  },
+  {
+    "case": "accepted but reply missing-status",
+    "statuses": [
+      "UNKNOWN",
+      "REJECTED"
+    ],
+    "submissions": 1
+  },
+  {
+    "case": "order complete but position update delayed",
+    "statuses": [
+      "PLACED",
+      "REJECTED"
+    ],
+    "submissions": 1,
+    "position_rows": 0
+  },
+  {
+    "case": "sequential hidden entries in different instruments",
+    "statuses": [
+      "PLACED",
+      "PLACED"
+    ],
+    "deployment_cap": 60000,
+    "submitted_notional": 60000,
+    "submissions": 2
+  },
+  {
+    "case": "unknown prior-day submission, no broker resolution",
+    "statuses": [
+      "UNKNOWN",
+      "REJECTED"
+    ],
+    "submissions": 1
+  }
+]

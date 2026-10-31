@@ -188,6 +188,8 @@ class SecureVault:
             credentials_to_store["ANGEL_TOTP_SECRET"] = settings.ANGEL_TOTP_SECRET
         if settings.GEMINI_API_KEY:
             credentials_to_store["GEMINI_API_KEY"] = settings.GEMINI_API_KEY
+        if getattr(settings, "UPSTOX_ANALYTICS_TOKEN", ""):
+            credentials_to_store["UPSTOX_ANALYTICS_TOKEN"] = settings.UPSTOX_ANALYTICS_TOKEN
 
         if not credentials_to_store:
             logger.warning("No credentials found in .env — vault will be empty")

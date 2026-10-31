@@ -1,0 +1,52 @@
+# Data fetching
+yfinance>=0.2.31
+requests>=2.31.0
+pandas>=2.1.0
+
+# Angel One SmartAPI
+# data/streams/websocket_manager.py disables the SDK's internal reconnect
+# (max_retry_attempt=0) and owns resubscribe itself; that policy is verified
+# against 1.5.5 (+ websocket-client 1.9.2). Re-verify before widening.
+smartapi-python>=1.5.5
+logzero>=1.7.0
+pyotp>=2.9.0
+
+# AI Integration (optional, for GeminiAnalyzer)
+google-generativeai>=0.5.0
+
+# Database
+psycopg2-binary>=2.9.9
+
+# REST API
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# Scheduling
+APScheduler>=3.10.0
+
+# WebSocket
+websocket-client>=1.6.0
+
+# Security
+cryptography>=41.0.0
+
+# Configuration
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# Logging
+loguru>=0.7.0
+
+# CLI Output
+colorama>=0.4.6
+tabulate>=0.9.0
+rich>=13.7.0
+
+# Utilities
+numpy>=1.26.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.23.0
