@@ -1,1 +1,0 @@
-"""Trend-Investorr: Core package."""

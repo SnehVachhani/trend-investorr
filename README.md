@@ -1,8 +1,9 @@
-# AlgoAnalyst Backend
+# Trend Investorr
 
-Python backend for market data, stock scanners, historical backtests and trading.
-Source modules and tests are included. The web frontend and Java service are not
-part of this backend workspace.
+Stock market analysis and trading platform for Indian equities, with a Python
+backend, Next.js frontend, PostgreSQL storage, and a browser extension for
+screener integration. It provides market data, stock scanners, historical
+backtests, watchlists, portfolio tracking, and paper or live trading.
 
 ## Setup
 
@@ -13,6 +14,11 @@ python3 -m venv /tmp/venv
 /tmp/venv/bin/python -m pip install -r requirements.txt
 /tmp/venv/bin/python -m pip install -r requirements-dev.txt
 ```
+
+## Frontend
+
+From `frontend/`, run `npm ci` and then `npm run dev`. Configure backend
+and database settings using `.env.example` as a template for your local `.env`.
 
 ## Focused existing checks
 
@@ -67,11 +73,12 @@ separately configured external services, including PostgreSQL.
 
 The source includes the completed live-entry and square-off safeguards and
 durable Enhanced Momentum replay job tracking (`enhanced_momentum_backtest_jobs`,
-covered by `tests/api/test_enhanced_momentum_backtest_job_durability.py`). No
-live-feed lifecycle fixes have been applied in this snapshot.
+covered by `tests/api/test_enhanced_momentum_backtest_job_durability.py`). The source also includes
+WebSocket subscription, reconnect, generation, and health fixes.
 API runtime and test-client dependencies are included in the requirements files.
 
-Git history, agent instruction files, virtual environments, local configuration,
-vaults, runtime data, generated logs and caches are excluded. Credential-like
+Synchronization exports, review evidence, the retired Spring Boot implementation,
+virtual environments, local configuration, vaults, runtime data, generated logs,
+and caches are excluded from version control. Credential-like
 values in security tests are synthetic fixtures; tests create their own temporary
 vaults and keys.

@@ -1,8 +1,0 @@
-{
-  "same-tag-wrong-exchange-probe": {
-    "first_status": "UNKNOWN",
-    "second_status": "REJECTED",
-    "submissions": 1,
-    "reservation_retained": true
-  }
-}

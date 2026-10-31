@@ -1,7 +1,0 @@
-{
-  "scenario": "instance A completes square-off at 15:16; B uses same entry store",
-  "A_entries_closed": true,
-  "B_entries_closed": false,
-  "B_status": "PLACED",
-  "broker_submissions": 1
-}

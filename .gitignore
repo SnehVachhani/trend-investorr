@@ -37,3 +37,41 @@ Thumbs.db
 # Exported Data
 export_*.csv
 *squirrel*.sql
+
+# Local synchronization exports and review evidence
+/.codex-attachments/
+/flagfix-*/
+/graphify-out/
+/reports/
+/PORTABLE_SETUP.md
+
+# Retired Java implementation (kept locally only)
+/spring-boot/
+
+# One-off local diagnostics and database maintenance
+/_check_db.py
+/check_*.py
+/debug_*.py
+/test_resolve.py
+/cleanup_db.py
+/manual_backfill_daily.py
+/pyrightconfig.json
+
+# Generated dependencies, builds, tests, and editor caches
+node_modules/
+.next/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+*.tsbuildinfo
+
+# Local environment overrides and database files
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
